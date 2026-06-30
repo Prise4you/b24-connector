@@ -1,0 +1,38 @@
+{
+  "webhook_url": "https://ВАШ-ПОРТАЛ.bitrix24.ru/rest/1/ТОКЕН_ВЕБХУКА/",
+
+  "projects": [
+    {
+      "group_id": 506,
+      "notebook_id": "",
+      "notebook_name": "Сайты АНИТ",
+      "chats": [],
+      "sources": {
+        "tasks": true,
+        "task_comments": true,
+        "group_chat": true,
+        "disk_files": true
+      }
+    }
+  ],
+
+  "include": {
+    "tasks": true,
+    "task_comments": true,
+    "group_chat": true,
+    "disk_files": true,
+    "crm": {
+      "enabled": false,
+      "company_ids": [],
+      "contact_ids": [],
+      "notebook_id": ""
+    }
+  },
+
+  "targets": {
+    "notebooklm": { "enabled": true }
+  },
+
+  "output_dir": "out",
+  "state_file": "state/state.json"
+}

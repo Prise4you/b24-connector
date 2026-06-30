@@ -1,0 +1,49 @@
+name: B24 → NotebookLM Sync
+
+on:
+  # Вызов из webhook.php при событии в Б24
+  repository_dispatch:
+    types: [sync_trigger]
+
+  # Резервное расписание: раз в час (если webhook пропустил событие)
+  schedule:
+    - cron: '0 * * * *'
+
+  # Ручной запуск через интерфейс GitHub
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Restore NotebookLM session
+        run: |
+          mkdir -p ~/.notebooklm/profiles/default
+          echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
+            > ~/.notebooklm/profiles/default/storage_state.json
+
+      - name: Run connector
+        env:
+          NLM_BIN: notebooklm
+          CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
+        run: |
+          python connector.py \
+            --config-url https://anitconf.ru/ntlm/api/config.php \
+            --status-url https://anitconf.ru/ntlm/api/status.php \
+            --connector-token "$CONNECTOR_TOKEN"
