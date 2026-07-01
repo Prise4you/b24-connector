@@ -1264,7 +1264,11 @@ def main():
             if files:
                 docs["files.md"] = build_files_doc(files, group_name)
 
-        for chat_id in proj.get("chats", []):
+        _raw_chats = list(proj.get("chats") or [])
+        _ol_ids = [str(ol["id"]) for ol in (proj.get("open_lines_data") or [])
+                   if isinstance(ol, dict) and ol.get("id")]
+        _seen = set(str(x) for x in _raw_chats)
+        for chat_id in _raw_chats + [x for x in _ol_ids if x not in _seen]:
             print(f"\n→ Чат {chat_id}")
             try:
                 messages = _get_chat_messages(c, chat_id)
