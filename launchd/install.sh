@@ -4,7 +4,7 @@
 # 2) Ставит launchd-агент, который каждые 10 мин опрашивает очередь
 set -e
 
-DIR="/Users/prise4you/b24-connector"
+DIR="/Users/prise4you/b24-notebooklm/connector"
 PLIST="$DIR/launchd/com.anit.b24kb.poll.plist"
 DEST="$HOME/Library/LaunchAgents/com.anit.b24kb.poll.plist"
 

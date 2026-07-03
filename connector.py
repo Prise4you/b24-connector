@@ -283,17 +283,34 @@ def extract_comments_bulk(c: B24Client, task_ids: list) -> dict:
     """Пакетно загрузить комментарии для всех задач. Возвращает {task_id: [comments]}."""
     print(f"  Загружаю комментарии ({len(task_ids)} задач, batch)...")
     result = {}
-    for chunk in _chunks(task_ids, 40):
+    failed_chunks = 0
+    for chunk in _chunks(task_ids, 15):
         cmds = {f"c{tid}": ("task.commentitem.getlist",
                             {"TASKID": tid, "ORDER": {"ID": "ASC"}})
                 for tid in chunk}
-        res = c.batch(cmds)
+        res = None
+        for attempt in range(2):
+            try:
+                res = c.batch(cmds)
+                break
+            except B24Error as e:
+                if attempt == 0:
+                    print(f"    ⚠️  Чанк комментариев не загружен ({e}), повтор...")
+                    time.sleep(2.0)
+                else:
+                    print(f"    ❌ Чанк комментариев пропущен после повтора: {e}")
+                    failed_chunks += 1
+        if res is None:
+            for tid in chunk:
+                result.setdefault(str(tid), [])
+            continue
         inner = res.get("result", {})
         for tid in chunk:
             item = inner.get(f"c{tid}")
             result[str(tid)] = item if isinstance(item, list) else []
     total = sum(len(v) for v in result.values())
-    print(f"    Комментариев всего: {total}")
+    print(f"    Комментариев всего: {total}" +
+          (f" (пропущено чанков: {failed_chunks})" if failed_chunks else ""))
     return result
 
 def extract_group_chat(c: B24Client, group_id: int) -> tuple:
@@ -831,209 +848,6 @@ def _get_chat_messages(c: B24Client, chat_id) -> list:
     return messages
 
 
-def extract_open_line(c: B24Client, line_id: int) -> list:
-    """
-    Загрузить диалоги открытой линии line_id через im.recent.list (TYPE=lines).
-    im.recent.list возвращает {items: [...], hasMore: bool} — пагинируем вручную.
-    Фильтруем по line_id через imopenlines.crm.chat.get на каждый dialogId.
-    """
-    print(f"  Загружаю чаты открытых линий через im.recent.list...")
-
-    all_chats = []
-    try:
-        offset = 0
-        while True:
-            raw = c.call("im.recent.list", {"TYPE": "lines", "LIMIT": 50, "OFFSET": offset})
-            if isinstance(raw, list):
-                items, has_more = raw, False
-            elif isinstance(raw, dict):
-                items = raw.get("items", [])
-                if isinstance(items, dict):
-                    items = list(items.values())
-                has_more = bool(raw.get("hasMore", False))
-            else:
-                break
-            dict_items = [i for i in items if isinstance(i, dict)]
-            all_chats.extend(dict_items)
-            if not has_more or len(dict_items) < 50:
-                break
-            offset += 50
-    except B24Error as e:
-        print(f"    im.recent.list недоступен: {e}")
-
-    print(f"    Всего чатов открытых линий на портале: {len(all_chats)}")
-
-    if not all_chats:
-        print("    Фолбэк: последние 300 сделок CRM...")
-        deals_raw = []
-        for item in c.call_list("crm.deal.list", {
-            "order": {"ID": "DESC"},
-            "select": ["ID", "TITLE", "DATE_CREATE", "STAGE_ID", "CLOSED"],
-        }):
-            deals_raw.append(item)
-            if len(deals_raw) >= 300:
-                break
-        print(f"    Взято сделок: {len(deals_raw)}")
-        return _extract_open_line_via_crm(c, deals_raw, line_id)
-
-    # Для каждого чата узнаём OPEN_LINE_ID через im.chat.get и фильтруем
-    print(f"    Фильтрую по линии {line_id}...")
-    result = []
-    for i, chat in enumerate(all_chats, 1):
-        dialog_id = (chat.get("dialogId") or chat.get("id") or
-                     chat.get("DIALOG_ID") or chat.get("CHAT_ID") or "")
-        if not dialog_id:
-            continue
-        chat_id = str(dialog_id).replace("chat", "")
-
-        # Получаем информацию о чате чтобы проверить OPEN_LINE_ID
-        try:
-            chat_info_raw = c.call("im.chat.get", {"CHAT_ID": chat_id}) or {}
-        except B24Error:
-            chat_info_raw = {}
-
-        chat_line = (chat_info_raw.get("OPEN_LINE_ID") or
-                     chat_info_raw.get("openLineId") or
-                     chat.get("OPEN_LINE_ID") or "")
-
-        # Если линия известна и не совпадает — пропускаем
-        if chat_line and str(chat_line) != str(line_id):
-            continue
-
-        # Если линия не определена — включаем (лучше лишнее, чем пропустить)
-        messages = _get_chat_messages(c, chat_id)
-        merged = {**chat, **chat_info_raw}
-        result.append({"chat_info": merged, "messages": messages, "deal": {}})
-        if len(result) % 5 == 0:
-            print(f"    Найдено для линии {line_id}: {len(result)} (проверено {i}/{len(all_chats)})")
-
-    print(f"    Итого диалогов линии {line_id}: {len(result)}")
-    return result
-
-
-def _extract_open_line_via_crm(c: B24Client, deals: list, line_id: int) -> list:
-    """Вспомогательный: ищет чаты в переданных сделках."""
-    result = []
-    for i, deal in enumerate(deals, 1):
-        deal_id = deal.get("ID")
-        try:
-            chats_raw = c.call("imopenlines.crm.chat.get", {
-                "CRM_ENTITY_TYPE": "deal",
-                "CRM_ENTITY": deal_id,
-                "ACTIVE_ONLY": "N"
-            })
-        except B24Error:
-            continue
-        if not chats_raw:
-            continue
-        if isinstance(chats_raw, dict):
-            chats_raw = [chats_raw]
-        deal_chats = []
-        for chat_info in chats_raw:
-            chat_line = (chat_info.get("OPEN_LINE_ID") or chat_info.get("open_line_id") or "")
-            if chat_line and str(chat_line) != str(line_id):
-                continue
-            chat_id = chat_info.get("CHAT_ID") or chat_info.get("chatId") or chat_info.get("id")
-            if not chat_id:
-                continue
-            messages = _get_chat_messages(c, chat_id)
-            deal_chats.append({"chat_info": chat_info, "messages": messages})
-        if deal_chats:
-            result.append({"deal": deal, "chats": deal_chats})
-        if i % 50 == 0 or i == len(deals):
-            print(f"    Сделок проверено: {i}/{len(deals)}, с чатами: {len(result)}")
-    return result
-
-
-def build_openline_doc(sessions_data: list, line_id: int) -> str:
-    lines = [
-        f"# Открытая линия {line_id} — диалоги с клиентами",
-        f"_Сгенерировано: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_",
-        f"_Диалогов: {len(sessions_data)}_",
-        ""
-    ]
-    for item in sessions_data:
-        # Поддержка двух форматов: {deal, chats} и {chat_info, messages, deal}
-        if "chats" in item:
-            # Формат CRM-фолбэка: {deal, chats: [{chat_info, messages}]}
-            deal = item["deal"]
-            deal_id    = deal.get("ID", "")
-            deal_title = deal.get("TITLE", f"Сделка #{deal_id}")
-            created    = fmt_date(deal.get("DATE_CREATE", ""))
-            stage      = deal.get("STAGE_ID", "")
-            closed     = "Да" if deal.get("CLOSED") == "Y" else "Нет"
-
-            lines.append(f"## Сделка #{deal_id}: {deal_title}")
-            meta = []
-            if created: meta.append(f"**Создана:** {created}")
-            if stage:   meta.append(f"**Стадия:** {stage}")
-            meta.append(f"**Закрыта:** {closed}")
-            lines.append("  ".join(meta))
-            lines.append("")
-
-            for chat_item in item["chats"]:
-                _append_chat_messages(lines, chat_item["messages"], chat_item["chat_info"])
-        else:
-            # Формат im.recent.list: {chat_info, messages, deal}
-            chat_info = item.get("chat_info", {})
-            msgs      = item.get("messages", [])
-            title     = (chat_info.get("name") or chat_info.get("title")
-                         or chat_info.get("NAME") or f"Диалог")
-            date      = fmt_date(chat_info.get("dateLastActivity") or
-                                  chat_info.get("lastActivityDate") or
-                                  chat_info.get("DATE_CREATE") or "")
-
-            lines.append(f"## {title}")
-            if date:
-                lines.append(f"**Последняя активность:** {date}")
-            lines.append("")
-            _append_chat_messages(lines, msgs, chat_info)
-
-        lines.append("---")
-        lines.append("")
-    return "\n".join(lines)
-
-
-def build_specific_chat_doc(messages: list, chat_id: int, group_name: str) -> str:
-    """Документ для конкретного чата по его ID."""
-    lines = [
-        f"# {group_name} — Чат {chat_id}",
-        f"_Сгенерировано: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_",
-        f"_Сообщений: {len(messages)}_",
-        ""
-    ]
-    for msg in reversed(messages):
-        author = (msg.get("authorName") or msg.get("AUTHOR_NAME")
-                  or f"ID{msg.get('authorId', msg.get('AUTHOR_ID', ''))}")
-        date   = fmt_datetime(msg.get("date") or msg.get("DATE_CREATE", ""))
-        text   = clean_bbcode(msg.get("text") or msg.get("MESSAGE", ""))
-        if text:
-            lines.append(f"[{date}] **{author}:** {text[:600]}")
-        for fl in _fmt_msg_files(msg):
-            lines.append(fl)
-    return "\n".join(lines)
-
-
-def _append_chat_messages(lines: list, msgs: list, chat_info: dict) -> None:
-    line_label = chat_info.get("OPEN_LINE_ID") or chat_info.get("open_line_id") or ""
-    header = f"**Переписка ({len(msgs)} сообщений)"
-    if line_label:
-        header += f" [линия {line_label}]"
-    header += ":**"
-    lines.append(header)
-    lines.append("")
-    for msg in reversed(msgs):
-        author = (msg.get("authorName") or msg.get("AUTHOR_NAME")
-                  or f"ID{msg.get('authorId', msg.get('AUTHOR_ID', ''))}")
-        date   = fmt_date(msg.get("date") or msg.get("DATE_CREATE", ""))
-        text   = clean_bbcode(msg.get("text") or msg.get("MESSAGE", ""))
-        if text:
-            lines.append(f"[{date}] **{author}:** {text[:600]}")
-        for fl in _fmt_msg_files(msg):
-            lines.append(fl)
-    lines.append("")
-
-
 # ─── SAVE ─────────────────────────────────────────────────────────────────────
 
 def save_docs(docs: dict, out_dir: str):
@@ -1152,7 +966,7 @@ def main():
     security.harden_config_file(args.config)
     security.audit_run_start(cfg, "dry-run" if args.dry_run else "full")
 
-    c = B24Client(webhook, timeout=120)
+    c = B24Client(webhook, timeout=180)
     print("Подключение к Bitrix24...")
     me = c.call("profile")
     print(f"Авторизован как: {me.get('NAME')} {me.get('LAST_NAME')}")

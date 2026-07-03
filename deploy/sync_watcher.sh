@@ -15,7 +15,7 @@
 set -euo pipefail
 
 PYTHON="${PYTHON:-/usr/bin/python3}"
-CONNECTOR_DIR="${CONNECTOR_DIR:-/Users/prise4you/b24-connector}"
+CONNECTOR_DIR="${CONNECTOR_DIR:-/Users/prise4you/b24-notebooklm/connector}"
 
 # 1. Узнаём, есть ли запрос на синхронизацию
 state="$(curl -fsS -H "X-Connector-Token: ${CONNECTOR_TOKEN}" "${SYNC_URL}" || echo '{}')"
