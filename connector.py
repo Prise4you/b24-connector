@@ -71,6 +71,43 @@ def post_run_status(url: str, token: str, payload: dict) -> None:
     except Exception as e:
         print(f"  ⚠️  Не удалось отправить статус на хостинг: {e}")
 
+
+def push_remote_config(url: str, token: str, cfg: dict) -> None:
+    """
+    Отправить обновлённый config.json обратно на хостинг (POST, тот же
+    api/config.php, что использует и панель — принимает X-Connector-Token).
+    Нужно вызывать сразу после изменения notebook_id при работе через
+    --config-url: без этого id создаваемого ноутбука существует только в
+    памяти эфемерного прогона (напр. GitHub Actions раннера) и теряется
+    навсегда, вызывая создание нового ноутбука при каждом следующем прогоне.
+    """
+    body = json.dumps(cfg, ensure_ascii=False).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "X-Connector-Token": token},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
+def save_config(cfg: dict, args, connector_token: str) -> None:
+    """
+    Сохранить изменённый конфиг там, откуда он был загружен: на хостинг
+    (если работали через --config-url) или в локальный файл.
+    """
+    if args.config_url and connector_token:
+        try:
+            push_remote_config(args.config_url, connector_token, cfg)
+            print("  Конфиг обновлён на хостинге")
+        except Exception as e:
+            print(f"  ⚠️  Не удалось сохранить конфиг на хостинге ({e})")
+    else:
+        with open(args.config, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, ensure_ascii=False, indent=2)
+        security.harden_config_file(args.config)
+
 # ─── справочники ──────────────────────────────────────────────────────────────
 
 PRIORITY_LABELS = {"0": "Низкий", "1": "Средний", "2": "Высокий"}
@@ -368,6 +405,136 @@ def _walk_folder(c, folder_id, files, depth):
         else:
             files.append(item)
 
+
+# ─── содержимое файлов диска (не только метаданные) ───────────────────────────
+
+_ASIS_EXTS = {"pdf", "png", "jpg", "jpeg", "gif", "webp"}
+_TEXT_CONVERTIBLE_EXTS = {"docx", "xlsx"}
+_INLINE_TEXT_EXTS = {"txt", "md", "csv"}
+_MAX_DISK_FILE_BYTES = 20 * 1024 * 1024
+_MAX_INLINE_TEXT_BYTES = 100 * 1024
+
+
+def _disk_file_download_url(c: B24Client, file_id) -> str:
+    try:
+        f = c.call("disk.file.get", {"id": int(file_id)})
+        return f.get("DOWNLOAD_URL", "")
+    except B24Error:
+        return ""
+
+
+def convert_docx_to_text(data: bytes) -> str:
+    import io
+    from docx import Document
+    doc = Document(io.BytesIO(data))
+    return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+
+def convert_xlsx_to_markdown(data: bytes, max_rows: int = 200) -> str:
+    import io
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    lines = []
+    for ws in wb.worksheets:
+        lines.append(f"## Лист «{ws.title}»")
+        row_count = 0
+        for row in ws.iter_rows(values_only=True):
+            if row_count >= max_rows:
+                lines.append(f"_...усечено, показаны первые {max_rows} строк_")
+                break
+            cells = [str(v) if v is not None else "" for v in row]
+            if any(cells):
+                lines.append("| " + " | ".join(cells) + " |")
+            row_count += 1
+        lines.append("")
+    return "\n".join(lines)
+
+
+def prepare_disk_attachments(c: B24Client, files: list, group_name: str,
+                             proj_dir: str, limit: int = 15) -> tuple:
+    """
+    Скачать содержимое top-N файлов диска (по дате изменения) и подготовить
+    к загрузке в NotebookLM:
+      - PDF/изображения — as-is, отдельными бинарными source (NotebookLM
+        парсит PDF нативно; конвертация не нужна). Сознательно БЕЗ прогона
+        через security.redact_doc — бинарные файлы физически не читаемы
+        текстовым фильтром секретов (см. connector/CLAUDE.md).
+      - Word (.docx)/Excel (.xlsx) — конвертация в текст, уходит в общий
+        docs{} и, значит, через обычный redact_doc наравне с tasks.md и т.д.
+      - Мелкие текстовые файлы (.txt/.md/.csv) — встраиваются прямо в
+        files.md, не как отдельный source (экономия лимита источников).
+    Остальные (вне top-N/неподдерживаемые) — только метаданные, как раньше.
+
+    Возвращает (text_docs, binary_attachments, inline_sections):
+      text_docs — {"disk_<file_id>.md": content} для docs{} (пройдёт redact)
+      binary_attachments — [(path, title)] для upload_doc as-is
+      inline_sections — [str] дополнительные секции для files.md
+    """
+    text_docs = {}
+    binary_attachments = []
+    inline_sections = []
+
+    real_files = [f for f in files if f.get("TYPE") != "folder"]
+    real_files.sort(key=lambda f: f.get("UPDATE_TIME") or f.get("CREATE_TIME") or "",
+                     reverse=True)
+    top = real_files[:limit]
+
+    attach_dir = Path(proj_dir) / "disk_attachments"
+
+    for f in top:
+        name = f.get("NAME", "")
+        ext = (f.get("EXTENSION") or Path(name).suffix.lstrip(".")).lower()
+        file_id = f.get("ID")
+        size = int(f.get("SIZE") or 0)
+        if not file_id or size > _MAX_DISK_FILE_BYTES:
+            continue
+
+        if ext in _INLINE_TEXT_EXTS:
+            if size > _MAX_INLINE_TEXT_BYTES:
+                continue
+            url = _disk_file_download_url(c, file_id)
+            data = _download_bytes(url) if url else b""
+            if not data:
+                continue
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = data.decode("cp1251", errors="replace")
+            inline_sections.append(f"\n### {name}\n\n{text[:5000]}\n")
+            continue
+
+        if ext not in _ASIS_EXTS and ext not in _TEXT_CONVERTIBLE_EXTS:
+            continue
+
+        url = _disk_file_download_url(c, file_id)
+        data = _download_bytes(url) if url else b""
+        if not data:
+            continue
+
+        if ext in _ASIS_EXTS:
+            attach_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = re.sub(r'[^\w.\-]', '_', name)
+            dest = attach_dir / f"{file_id}_{safe_name}"
+            dest.write_bytes(data)
+            binary_attachments.append((str(dest), f"{group_name} — Файл: {name}"))
+            print(f"    📎 as-is: {name} ({size // 1024} KB)")
+        else:
+            try:
+                if ext == "docx":
+                    text = convert_docx_to_text(data)
+                else:
+                    text = convert_xlsx_to_markdown(data)
+            except Exception as e:
+                print(f"    ⚠️  не удалось сконвертировать {name}: {e}")
+                continue
+            if text.strip():
+                text_docs[f"disk_{file_id}.md"] = (
+                    f"# {group_name} — {name}\n\n{text}"
+                )
+                print(f"    📄 сконвертирован: {name} ({len(text)} симв.)")
+
+    return text_docs, binary_attachments, inline_sections
+
 # ─── EXTRACT: CRM ─────────────────────────────────────────────────────────────
 
 def extract_crm_companies(c: B24Client, ids: list) -> list:
@@ -470,6 +637,68 @@ def extract_crm_smart(c: B24Client, company_ids: list = None) -> list:
             pass
     print(f"    Смарт-элементов: {len(items)}")
     return items
+
+
+_TIMELINE_MAX_PER_ENTITY = 100  # cap на карточку — не тянуть всю историю старой сделки
+
+
+def extract_crm_timeline(c: B24Client, entities: list) -> list:
+    """
+    История комментариев (crm.timeline.comment.list) по списку сущностей
+    entities: [{"type": "company"|"contact"|"deal", "id": ..., "name": ...}].
+    Ограничено _TIMELINE_MAX_PER_ENTITY на карточку — не вся история, а
+    последние записи (сортировка по CREATED, свежие первыми).
+    """
+    print("  Загружаю историю комментариев CRM (timeline)...")
+    result = []
+    for ent in entities:
+        entity_type, entity_id = ent.get("type"), ent.get("id")
+        if not entity_type or not entity_id:
+            continue
+        try:
+            rows = list(c.call_list("crm.timeline.comment.list", {
+                "filter": {"ENTITY_ID": entity_id, "ENTITY_TYPE": entity_type},
+                "select": ["ID", "CREATED", "AUTHOR_ID", "COMMENT"],
+            }))
+        except B24Error:
+            continue
+        rows.sort(key=lambda r: r.get("CREATED") or "", reverse=True)
+        for r in rows[:_TIMELINE_MAX_PER_ENTITY]:
+            r["_entity_name"] = ent.get("name", f"{entity_type} #{entity_id}")
+        result.extend(rows[:_TIMELINE_MAX_PER_ENTITY])
+    print(f"    Комментариев (timeline): {len(result)}")
+    return result
+
+
+def extract_crm_activities(c: B24Client, entities: list) -> list:
+    """
+    Завершённые активности (звонки/письма/встречи, БЕЗ записи звонка —
+    только метаданные: тема, направление, дата) через crm.activity.list.
+    entities: [{"type": "company"|"contact"|"deal", "id": ..., "name": ...}].
+    """
+    print("  Загружаю активности CRM...")
+    _OWNER_TYPE_ID = {"company": 4, "contact": 3, "deal": 2}
+    result = []
+    for ent in entities:
+        entity_type, entity_id = ent.get("type"), ent.get("id")
+        owner_type_id = _OWNER_TYPE_ID.get(entity_type)
+        if not owner_type_id or not entity_id:
+            continue
+        try:
+            rows = list(c.call_list("crm.activity.list", {
+                "filter": {"OWNER_TYPE_ID": owner_type_id, "OWNER_ID": entity_id,
+                           "COMPLETED": "Y"},
+                "select": ["ID", "SUBJECT", "DESCRIPTION", "DIRECTION",
+                           "TYPE_ID", "CREATED", "END_TIME"],
+            }))
+        except B24Error:
+            continue
+        rows.sort(key=lambda r: r.get("CREATED") or "", reverse=True)
+        for r in rows[:_TIMELINE_MAX_PER_ENTITY]:
+            r["_entity_name"] = ent.get("name", f"{entity_type} #{entity_id}")
+        result.extend(rows[:_TIMELINE_MAX_PER_ENTITY])
+    print(f"    Активностей: {len(result)}")
+    return result
 
 
 # ─── TRANSFORM: задачи ────────────────────────────────────────────────────────
@@ -658,7 +887,7 @@ def build_chat_doc(dialog: dict, messages: list, group_name: str) -> str:
 
 # ─── TRANSFORM: файлы диска ───────────────────────────────────────────────────
 
-def build_files_doc(files: list, group_name: str) -> str:
+def build_files_doc(files: list, group_name: str, inline_sections: list = None) -> str:
     lines = [
         f"# {group_name} — Файлы на диске",
         f"_Сгенерировано: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_",
@@ -671,6 +900,10 @@ def build_files_doc(files: list, group_name: str) -> str:
         created = fmt_date(f.get("CREATE_TIME", ""))
         ext     = f.get("EXTENSION", "").upper()
         lines.append(f"- **{name}** ({ext}, {size} байт, загружен {created})")
+    if inline_sections:
+        lines.append("")
+        lines.append("## Содержимое небольших текстовых файлов")
+        lines.extend(inline_sections)
     return "\n".join(lines)
 
 # ─── TRANSFORM: CRM ───────────────────────────────────────────────────────────
@@ -806,6 +1039,50 @@ def build_crm_smart_doc(items: list) -> str:
             if created:
                 row += f" | создан: {created}"
             lines.append(row)
+        lines.append("")
+    return "\n".join(lines)
+
+
+_ACTIVITY_DIRECTION_LABELS = {"1": "входящая", "2": "исходящая"}
+
+
+def build_crm_timeline_doc(comments: list, activities: list) -> str:
+    """История активности CRM: комментарии таймлайна + завершённые активности,
+    сгруппированные по карточке (entity_name)."""
+    lines = [
+        "# CRM — История активности",
+        f"_Сгенерировано: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_",
+        f"_Комментариев: {len(comments)}, активностей: {len(activities)}_",
+        ""
+    ]
+    from collections import defaultdict
+    by_entity: dict = defaultdict(lambda: {"comments": [], "activities": []})
+    for c in comments:
+        by_entity[c.get("_entity_name", "?")]["comments"].append(c)
+    for a in activities:
+        by_entity[a.get("_entity_name", "?")]["activities"].append(a)
+
+    for entity_name, data in by_entity.items():
+        lines.append(f"## {entity_name}")
+        if data["comments"]:
+            lines.append("**Комментарии:**")
+            for cm in data["comments"]:
+                dt = fmt_datetime(cm.get("CREATED", ""))
+                text = clean_bbcode(cm.get("COMMENT", ""))
+                if text:
+                    lines.append(f"- [{dt}] {text[:600]}")
+        if data["activities"]:
+            lines.append("**Активности:**")
+            for a in data["activities"]:
+                dt = fmt_datetime(a.get("CREATED", ""))
+                subj = a.get("SUBJECT", "") or "(без темы)"
+                direction = _ACTIVITY_DIRECTION_LABELS.get(str(a.get("DIRECTION", "")), "")
+                row = f"- [{dt}] {subj}"
+                if direction:
+                    row += f" ({direction})"
+                lines.append(row)
+        lines.append("")
+        lines.append("---")
         lines.append("")
     return "\n".join(lines)
 
@@ -964,6 +1241,7 @@ def main():
     inc     = cfg.get("include", {})
     out_dir = cfg.get("output_dir", "out")
     nlm_on  = cfg.get("targets", {}).get("notebooklm", {}).get("enabled", False)
+    dedupe_mode = cfg.get("dedupe_mode", "dry_run")  # "dry_run" | "delete" | "off"
 
     # Поддержка нового (projects[]) и старого (group_id) форматов конфига
     projects = cfg.get("projects")
@@ -1078,6 +1356,7 @@ def main():
 
         docs = {}
         chat_messages_for_audio = []
+        disk_binary_attachments = []
 
         if _want("tasks"):
             print("\n→ Задачи")
@@ -1096,7 +1375,11 @@ def main():
             print("\n→ Файлы диска")
             files = extract_disk_files(c, group_id)
             if files:
-                docs["files.md"] = build_files_doc(files, group_name)
+                disk_limit = int(proj.get("disk_files_limit", cfg.get("disk_files_limit", 15)))
+                text_docs, disk_binary_attachments, inline_sections = prepare_disk_attachments(
+                    c, files, group_name, proj_dir, limit=disk_limit)
+                docs.update(text_docs)
+                docs["files.md"] = build_files_doc(files, group_name, inline_sections)
 
         _raw_chats = list(proj.get("chats") or [])
         _ol_ids = [str(ol["id"]) for ol in (proj.get("open_lines_data") or [])
@@ -1143,6 +1426,18 @@ def main():
                 if smart:
                     docs["crm_smart.md"] = build_crm_smart_doc(smart)
 
+            if crm_src.get("timeline"):
+                company_names = {str(co["ID"]): (co.get("TITLE") or f"Компания #{co['ID']}")
+                                  for co in companies} if companies else {}
+                entities = [{"type": "company", "id": cid,
+                             "name": company_names.get(str(cid), f"Компания #{cid}")}
+                            for cid in proj_company_ids]
+                timeline_comments = extract_crm_timeline(c, entities)
+                timeline_activities = extract_crm_activities(c, entities)
+                if timeline_comments or timeline_activities:
+                    docs["crm_timeline.md"] = build_crm_timeline_doc(
+                        timeline_comments, timeline_activities)
+
         redacted, n_secrets = _redact_and_save(docs, proj_dir)
         secrets_grand_total += n_secrets
         security.audit_run_end(redacted, n_secrets)
@@ -1153,12 +1448,11 @@ def main():
                 import load_notebooklm
                 nb_id = proj.get("notebook_id", "")
                 new_id = load_notebooklm.load_to_notebooklm(
-                    proj_dir, nb_id, nb_title, list(redacted.keys()))
+                    proj_dir, nb_id, nb_title, list(redacted.keys()),
+                    dedupe_mode=dedupe_mode)
                 if new_id and new_id != nb_id:
                     cfg["projects"][idx]["notebook_id"] = new_id
-                    with open(args.config, "w", encoding="utf-8") as fh:
-                        json.dump(cfg, fh, ensure_ascii=False, indent=2)
-                    security.harden_config_file(args.config)
+                    save_config(cfg, args, connector_token)
                 print(f"✅ NotebookLM: https://notebooklm.google.com/notebook/{new_id}")
                 # Аудио из чата группы
                 if chat_messages_for_audio:
@@ -1166,7 +1460,10 @@ def main():
                     audio_dir = str(Path(proj_dir) / "audio")
                     audio_list = download_audio_from_messages(chat_messages_for_audio, audio_dir)
                     if audio_list:
-                        load_notebooklm.upload_audio_files(new_id, audio_list)
+                        load_notebooklm.upload_files(new_id, audio_list)
+                if disk_binary_attachments:
+                    print("  → Файлы диска as-is (PDF/изображения)")
+                    load_notebooklm.upload_files(new_id, disk_binary_attachments)
             except Exception as e:
                 print(f"❌ NotebookLM: {e}")
 
@@ -1193,6 +1490,25 @@ def main():
                 crm_docs["crm_contacts.md"] = build_crm_contacts_doc(contacts)
         if not company_ids and not contact_ids:
             print("  (нет выбранных сущностей — настройте company_ids/contact_ids)")
+
+        if crm_cfg.get("timeline") and (company_ids or contact_ids):
+            print("\n→ История активности (timeline)")
+            company_names = {str(co["ID"]): (co.get("TITLE") or f"Компания #{co['ID']}")
+                              for co in (companies if company_ids else [])}
+            contact_names = {}
+            for ct in (contacts if contact_ids else []):
+                full = " ".join(p for p in [ct.get("LAST_NAME", ""), ct.get("NAME", "")] if p).strip()
+                contact_names[str(ct["ID"])] = full or f"Контакт #{ct['ID']}"
+            entities = (
+                [{"type": "company", "id": cid, "name": company_names.get(str(cid), f"Компания #{cid}")}
+                 for cid in company_ids] +
+                [{"type": "contact", "id": cid, "name": contact_names.get(str(cid), f"Контакт #{cid}")}
+                 for cid in contact_ids]
+            )
+            timeline_comments = extract_crm_timeline(c, entities)
+            timeline_activities = extract_crm_activities(c, entities)
+            if timeline_comments or timeline_activities:
+                crm_docs["crm_timeline.md"] = build_crm_timeline_doc(timeline_comments, timeline_activities)
         if crm_docs:
             redacted_crm, n_sec = _redact_and_save(crm_docs, crm_dir)
             secrets_grand_total += n_sec
@@ -1203,12 +1519,11 @@ def main():
                     import load_notebooklm
                     nb_id = crm_cfg.get("notebook_id", "")
                     new_id = load_notebooklm.load_to_notebooklm(
-                        crm_dir, nb_id, "CRM АНИТ", list(redacted_crm.keys()))
+                        crm_dir, nb_id, "CRM АНИТ", list(redacted_crm.keys()),
+                        dedupe_mode=dedupe_mode)
                     if new_id and new_id != nb_id:
                         cfg["include"]["crm"]["notebook_id"] = new_id
-                        with open(args.config, "w", encoding="utf-8") as fh:
-                            json.dump(cfg, fh, ensure_ascii=False, indent=2)
-                        security.harden_config_file(args.config)
+                        save_config(cfg, args, connector_token)
                     print(f"✅ NotebookLM CRM: https://notebooklm.google.com/notebook/{new_id}")
                 except Exception as e:
                     print(f"❌ NotebookLM CRM: {e}")

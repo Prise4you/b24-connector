@@ -7,11 +7,19 @@
       "notebook_id": "",
       "notebook_name": "Сайты АНИТ",
       "chats": [],
+      "disk_files_limit": 15,
       "sources": {
         "tasks": true,
         "task_comments": true,
         "group_chat": true,
-        "disk_files": true
+        "disk_files": true,
+        "crm": {
+          "company_ids": [],
+          "contacts": false,
+          "deals": false,
+          "smart": false,
+          "timeline": false
+        }
       }
     }
   ],
@@ -25,9 +33,13 @@
       "enabled": false,
       "company_ids": [],
       "contact_ids": [],
+      "timeline": false,
       "notebook_id": ""
     }
   },
+
+  "dedupe_mode": "dry_run",
+  "disk_files_limit": 15,
 
   "targets": {
     "notebooklm": { "enabled": true }

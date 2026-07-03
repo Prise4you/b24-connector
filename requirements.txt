@@ -1,2 +1,4 @@
 notebooklm-py
 playwright
+python-docx
+openpyxl
