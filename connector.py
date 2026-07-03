@@ -92,6 +92,28 @@ def push_remote_config(url: str, token: str, cfg: dict) -> None:
         resp.read()
 
 
+def push_notebook_id_patch(url: str, token: str, kind: str, notebook_id: str,
+                            group_id: int = None) -> None:
+    """
+    Точечно обновить notebook_id ОДНОГО проекта (или CRM) на хостинге, не
+    перезаписывая весь config.json. Нужно для matrix-параллелизации
+    (несколько job'ов coннектора для разных проектов работают одновременно —
+    полная перезапись всего конфига одним из них могла бы затереть
+    notebook_id, только что сохранённый другим).
+    """
+    patch = {"kind": kind, "notebook_id": notebook_id}
+    if group_id is not None:
+        patch["group_id"] = group_id
+    body = json.dumps({"patch": patch}, ensure_ascii=False).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json", "X-Connector-Token": token},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
 def save_config(cfg: dict, args, connector_token: str) -> None:
     """
     Сохранить изменённый конфиг там, откуда он был загружен: на хостинг
@@ -1221,6 +1243,8 @@ def main():
     parser.add_argument("--bind", action="store_true")
     parser.add_argument("--poll", action="store_true")
     parser.add_argument("--group", type=int, help="Обработать только указанный group_id")
+    parser.add_argument("--crm-only", action="store_true",
+                         help="Пропустить проекты, синхронизировать только глобальный CRM-блок (для matrix-параллелизации)")
     args = parser.parse_args()
 
     connector_token = args.connector_token or os.environ.get("CONNECTOR_TOKEN", "")
@@ -1340,6 +1364,8 @@ def main():
 
     # ── Проекты ───────────────────────────────────────────────────────────────
     for idx, proj in enumerate(projects):
+        if args.crm_only:
+            continue
         if args.group and int(proj["group_id"]) != args.group:
             continue
         group_id   = int(proj["group_id"])
@@ -1452,7 +1478,15 @@ def main():
                     dedupe_mode=dedupe_mode)
                 if new_id and new_id != nb_id:
                     cfg["projects"][idx]["notebook_id"] = new_id
-                    save_config(cfg, args, connector_token)
+                    if args.config_url and connector_token:
+                        try:
+                            push_notebook_id_patch(args.config_url, connector_token,
+                                                    "project", new_id, group_id=group_id)
+                            print("  Конфиг обновлён на хостинге")
+                        except Exception as e:
+                            print(f"  ⚠️  Не удалось сохранить конфиг на хостинге ({e})")
+                    else:
+                        save_config(cfg, args, connector_token)
                 print(f"✅ NotebookLM: https://notebooklm.google.com/notebook/{new_id}")
                 # Аудио из чата группы
                 if chat_messages_for_audio:
@@ -1523,7 +1557,15 @@ def main():
                         dedupe_mode=dedupe_mode)
                     if new_id and new_id != nb_id:
                         cfg["include"]["crm"]["notebook_id"] = new_id
-                        save_config(cfg, args, connector_token)
+                        if args.config_url and connector_token:
+                            try:
+                                push_notebook_id_patch(args.config_url, connector_token,
+                                                        "crm", new_id)
+                                print("  Конфиг обновлён на хостинге")
+                            except Exception as e:
+                                print(f"  ⚠️  Не удалось сохранить конфиг на хостинге ({e})")
+                        else:
+                            save_config(cfg, args, connector_token)
                     print(f"✅ NotebookLM CRM: https://notebooklm.google.com/notebook/{new_id}")
                 except Exception as e:
                     print(f"❌ NotebookLM CRM: {e}")
@@ -1554,12 +1596,24 @@ def main():
             try:
                 import load_notebooklm
                 payload["nlm_session"] = load_notebooklm.session_status()
+                # При matrix-параллелизации (--group/--crm-only) каждый job знает
+                # только про свой проект из cfg, снятого в начале ЭТОГО прогона —
+                # notebook_id, только что сохранённые СОСЕДНИМИ параллельными
+                # job'ами, в нём ещё не отражены. Поэтому перечитываем актуальный
+                # конфиг с хостинга прямо перед снимком (GET дешёвый и безопасный,
+                # в отличие от полной перезаписи).
+                snapshot_cfg = cfg
+                if args.config_url and connector_token:
+                    try:
+                        snapshot_cfg = fetch_remote_config(args.config_url, connector_token)
+                    except Exception as e:
+                        print(f"  ⚠️  Не удалось перечитать конфиг для снимка ({e}), использую локальный")
                 known_notebooks = [
                     {"id": p.get("notebook_id"), "name": (p.get("notebook_name") or "").strip()
                                                           or _get_group_name(c, int(p["group_id"]))}
-                    for p in cfg.get("projects", []) if p.get("notebook_id")
+                    for p in snapshot_cfg.get("projects", []) if p.get("notebook_id")
                 ]
-                crm_nb_id = cfg.get("include", {}).get("crm", {}).get("notebook_id")
+                crm_nb_id = snapshot_cfg.get("include", {}).get("crm", {}).get("notebook_id")
                 if crm_nb_id:
                     known_notebooks.append({"id": crm_nb_id, "name": "CRM АНИТ"})
                 payload["notebooks"] = load_notebooklm.project_notebooks_snapshot(known_notebooks)

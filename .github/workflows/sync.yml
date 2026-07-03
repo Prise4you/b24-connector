@@ -13,9 +13,35 @@ on:
   workflow_dispatch:
 
 jobs:
-  sync:
+  # Узнаём список проектов из конфига на хостинге, чтобы разложить их по
+  # отдельным параллельным job'ам ниже (matrix). Без этого один процесс
+  # обходил все проекты последовательно и с новыми, более тяжёлыми фичами
+  # (содержимое файлов диска, дедуп, CRM-таймлайн) стал упираться в лимит
+  # времени job'а даже с несколькими проектами сразу.
+  discover:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    outputs:
+      groups: ${{ steps.list.outputs.groups }}
+    steps:
+      - id: list
+        env:
+          CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
+        run: |
+          GROUPS=$(curl -s "https://anitconf.ru/ntlm/api/config.php?raw=1" \
+            -H "X-Connector-Token: $CONNECTOR_TOKEN" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps([int(p['group_id']) for p in d.get('projects', [])]))")
+          echo "groups=$GROUPS" >> "$GITHUB_OUTPUT"
+          echo "Проекты: $GROUPS"
+
+  sync:
+    needs: discover
+    if: needs.discover.outputs.groups != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        group_id: ${{ fromJson(needs.discover.outputs.groups) }}
 
     steps:
       - name: Checkout
@@ -38,7 +64,7 @@ jobs:
           echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
             > ~/.notebooklm/profiles/default/storage_state.json
 
-      - name: Run connector
+      - name: Run connector (project ${{ matrix.group_id }})
         env:
           NLM_BIN: notebooklm
           CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
@@ -46,4 +72,42 @@ jobs:
           python connector.py \
             --config-url https://anitconf.ru/ntlm/api/config.php \
             --status-url https://anitconf.ru/ntlm/api/status.php \
-            --connector-token "$CONNECTOR_TOKEN"
+            --connector-token "$CONNECTOR_TOKEN" \
+            --group ${{ matrix.group_id }}
+
+  sync_crm:
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Restore NotebookLM session
+        run: |
+          mkdir -p ~/.notebooklm/profiles/default
+          echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
+            > ~/.notebooklm/profiles/default/storage_state.json
+
+      - name: Run connector (CRM only)
+        env:
+          NLM_BIN: notebooklm
+          CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
+        run: |
+          python connector.py \
+            --config-url https://anitconf.ru/ntlm/api/config.php \
+            --status-url https://anitconf.ru/ntlm/api/status.php \
+            --connector-token "$CONNECTOR_TOKEN" \
+            --crm-only
