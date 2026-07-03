@@ -34,7 +34,18 @@ jobs:
             -H "X-Connector-Token: $CONNECTOR_TOKEN" -o /tmp/cfg_response.txt
           echo "--- curl вернул: ---"
           cat /tmp/cfg_response.txt
-          GROUPS=$(python3 .github/discover_groups.py /tmp/cfg_response.txt)
+          python3 --version
+          set +e
+          GROUPS=$(python3 .github/discover_groups.py /tmp/cfg_response.txt 2>/tmp/discover_err.txt)
+          RC=$?
+          set -e
+          echo "--- python exit code: $RC ---"
+          echo "--- python stderr: ---"
+          cat /tmp/discover_err.txt
+          if [ "$RC" -ne 0 ] || [ -z "$GROUPS" ]; then
+            echo "Не удалось получить список проектов" >&2
+            exit 1
+          fi
           echo "groups=$GROUPS" >> "$GITHUB_OUTPUT"
           echo "Проекты: $GROUPS"
 
