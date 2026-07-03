@@ -382,7 +382,7 @@ def extract_crm_companies(c: B24Client, ids: list) -> list:
             if raw:
                 companies.append(raw)
     else:
-        companies = c.call_list("crm.company.list", {"select": select})
+        companies = list(c.call_list("crm.company.list", {"select": select}))
     print(f"    Компаний: {len(companies)}")
     return companies
 
@@ -400,7 +400,7 @@ def extract_crm_contacts(c: B24Client, ids: list) -> list:
             if raw:
                 contacts.append(raw)
     else:
-        contacts = c.call_list("crm.contact.list", {"select": select})
+        contacts = list(c.call_list("crm.contact.list", {"select": select}))
     print(f"    Контактов: {len(contacts)}")
     return contacts
 
@@ -415,7 +415,7 @@ def extract_crm_deals(c: B24Client, company_ids: list = None) -> list:
     }
     if company_ids:
         params["filter"]["COMPANY_ID"] = company_ids
-    deals = c.call_list("crm.deal.list", params)
+    deals = list(c.call_list("crm.deal.list", params))
     print(f"    Сделок: {len(deals)}")
     return deals
 
@@ -429,10 +429,10 @@ def extract_crm_contacts_by_company(c: B24Client, company_ids: list) -> list:
               "PHONE", "EMAIL", "COMPANY_ID", "COMPANY_TITLE",
               "POST", "SOURCE_ID", "DATE_CREATE", "DATE_MODIFY",
               "ASSIGNED_BY_ID", "COMMENTS"]
-    contacts = c.call_list("crm.contact.list", {
+    contacts = list(c.call_list("crm.contact.list", {
         "select": select,
         "filter": {"COMPANY_ID": company_ids},
-    })
+    }))
     print(f"    Контактов: {len(contacts)}")
     return contacts
 
@@ -846,6 +846,26 @@ def _get_chat_messages(c: B24Client, chat_id) -> list:
             break
         last_id = min(int(i) for i in ids)
     return messages
+
+
+def build_specific_chat_doc(messages: list, chat_id: int, group_name: str) -> str:
+    """Документ для конкретного чата по его ID."""
+    lines = [
+        f"# {group_name} — Чат {chat_id}",
+        f"_Сгенерировано: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_",
+        f"_Сообщений: {len(messages)}_",
+        ""
+    ]
+    for msg in reversed(messages):
+        author = (msg.get("authorName") or msg.get("AUTHOR_NAME")
+                  or f"ID{msg.get('authorId', msg.get('AUTHOR_ID', ''))}")
+        date   = fmt_datetime(msg.get("date") or msg.get("DATE_CREATE", ""))
+        text   = clean_bbcode(msg.get("text") or msg.get("MESSAGE", ""))
+        if text:
+            lines.append(f"[{date}] **{author}:** {text[:600]}")
+        for fl in _fmt_msg_files(msg):
+            lines.append(fl)
+    return "\n".join(lines)
 
 
 # ─── SAVE ─────────────────────────────────────────────────────────────────────
