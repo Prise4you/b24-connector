@@ -1546,13 +1546,23 @@ def main():
             "elapsed_sec":    elapsed,
             "group":          args.group,
         }
-        # Снимок NotebookLM: статус сессии + список ноутбуков с числом источников.
-        # Best-effort — если NLM недоступен, поля просто отсутствуют.
+        # Снимок NotebookLM: статус сессии + число источников по ИЗВЕСТНЫМ
+        # ноутбукам проектов (не весь аккаунт NotebookLM — там могут быть
+        # десятки посторонних личных ноутбуков, и опрос каждого из них по
+        # отдельности медленно/ненадёжно на ограниченном по времени прогоне).
         if nlm_on:
             try:
                 import load_notebooklm
                 payload["nlm_session"] = load_notebooklm.session_status()
-                payload["notebooks"]   = load_notebooklm.list_notebooks()
+                known_notebooks = [
+                    {"id": p.get("notebook_id"), "name": (p.get("notebook_name") or "").strip()
+                                                          or _get_group_name(c, int(p["group_id"]))}
+                    for p in cfg.get("projects", []) if p.get("notebook_id")
+                ]
+                crm_nb_id = cfg.get("include", {}).get("crm", {}).get("notebook_id")
+                if crm_nb_id:
+                    known_notebooks.append({"id": crm_nb_id, "name": "CRM АНИТ"})
+                payload["notebooks"] = load_notebooklm.project_notebooks_snapshot(known_notebooks)
             except Exception as e:
                 print(f"  ⚠️  Снимок NotebookLM не собран: {e}")
         print(f"\n→ Отправляю статус на {args.status_url} ...")

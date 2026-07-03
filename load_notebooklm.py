@@ -205,8 +205,16 @@ def dedupe_sources(notebook_id: str, expected_titles: set, group_prefix: str,
 
 def list_notebooks(with_source_counts: bool = True) -> list:
     """
-    Список ноутбуков NotebookLM: [{id, name, sources}].
+    Список ВСЕХ ноутбуков NotebookLM в аккаунте: [{id, name, sources}].
     Best-effort: при любой ошибке (нет сессии/сети) возвращает [] и не валит прогон.
+
+    ВНИМАНИЕ: перечисляет весь Google-аккаунт (включая личные/сторонние
+    ноутбуки, не только проектные), и с with_source_counts=True делает
+    отдельный CLI-вызов на КАЖДЫЙ найденный ноутбук — на аккаунте с
+    десятками ноутбуков это медленно и ненадёжно (легко упереться в лимит
+    времени прогона GitHub Actions). Для снимка в админ-панель используйте
+    project_notebooks_snapshot() ниже — он опрашивает только известные
+    ноутбуки проектов из config.json, а не весь аккаунт.
     """
     try:
         out = _run(["list", "--json"], timeout=60)
@@ -231,6 +239,31 @@ def list_notebooks(with_source_counts: bool = True) -> list:
         if with_source_counts:
             entry["sources"] = _count_sources(nb_id)
         result.append(entry)
+    return result
+
+
+def project_notebooks_snapshot(known: list) -> list:
+    """
+    Снимок числа источников ТОЛЬКО по известным ноутбукам проектов —
+    known: [{"id": notebook_id, "name": ...}, ...] (обычно из config.json:
+    projects[].notebook_id + include.crm.notebook_id). В отличие от
+    list_notebooks(), НЕ перечисляет весь аккаунт NotebookLM — только
+    опрашивает число источников по уже известным id, что быстро (N
+    CLI-вызовов на N реальных проектов, а не на весь аккаунт) и не тащит
+    в админ-панель посторонние личные ноутбуки пользователя.
+    """
+    result = []
+    seen = set()
+    for item in known:
+        nb_id = (item or {}).get("id") or ""
+        if not nb_id or nb_id in seen:
+            continue
+        seen.add(nb_id)
+        result.append({
+            "id": nb_id,
+            "name": item.get("name") or nb_id,
+            "sources": _count_sources(nb_id),
+        })
     return result
 
 
