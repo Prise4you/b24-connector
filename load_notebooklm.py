@@ -68,6 +68,27 @@ def ensure_notebook(notebook_id: str, title: str) -> str:
     return new_id
 
 
+def _ensure_notebook_with_retry(notebook_id: str, title: str,
+                                 retries: int = 2, backoff: float = 5.0) -> str:
+    """
+    Обёртка над ensure_notebook() с повтором — создание ноутбука иногда падает
+    (CLI error 2 / UNEXPECTED_ERROR) при параллельных matrix-job'ах, делящих
+    одну сессию NotebookLM (см. keepalive/ротацию cookie в notebooklm-py).
+    Мирроит паттерн повтора delete-by-title в upload_doc().
+    """
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            return ensure_notebook(notebook_id, title)
+        except NotebookLMError as e:
+            last_err = e
+            if attempt < retries:
+                print(f"    ⚠️  создание ноутбука «{title}» не удалось ({e}) — "
+                      f"повтор через {backoff:.0f}с (попытка {attempt + 2}/{retries + 1})")
+                time.sleep(backoff)
+    raise last_err
+
+
 _NOT_FOUND_MARKER = "No source found with title"
 
 
@@ -297,7 +318,7 @@ def load_to_notebooklm(docs_dir: str, notebook_id: str,
                  dry_run был просмотрен и подтверждён пользователем).
     """
     nb_title = f"{group_name} — база знаний проекта"
-    notebook_id = ensure_notebook(notebook_id, nb_title)
+    notebook_id = _ensure_notebook_with_retry(notebook_id, nb_title)
 
     expected_titles = set()
     any_possible_dup = False

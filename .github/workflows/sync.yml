@@ -65,6 +65,9 @@ jobs:
           echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
             > ~/.notebooklm/profiles/default/storage_state.json
 
+      - name: Stagger start (избежать конфликта параллельных сессий NotebookLM)
+        run: sleep $(( ${{ strategy.job-index }} * 15 ))
+
       - name: Run connector (project ${{ matrix.group_id }})
         env:
           NLM_BIN: notebooklm
@@ -101,6 +104,9 @@ jobs:
           mkdir -p ~/.notebooklm/profiles/default
           echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
             > ~/.notebooklm/profiles/default/storage_state.json
+
+      - name: Stagger start (после matrix-джобов проектов)
+        run: sleep 45
 
       - name: Run connector (CRM only)
         env:
