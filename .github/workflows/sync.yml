@@ -20,6 +20,7 @@ jobs:
   # (содержимое файлов диска, дедуп, CRM-таймлайн) стал упираться в лимит
   # времени job'а даже с несколькими проектами сразу.
   discover:
+    if: github.event_name != 'repository_dispatch' || github.event.action != 'full_inventory_trigger'
     runs-on: ubuntu-latest
     outputs:
       groups: ${{ steps.list.outputs.groups }}
@@ -37,7 +38,7 @@ jobs:
 
   sync:
     needs: discover
-    if: needs.discover.outputs.groups != '[]'
+    if: needs.discover.result == 'success' && needs.discover.outputs.groups != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -82,6 +83,7 @@ jobs:
 
   sync_crm:
     needs: discover
+    if: needs.discover.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
