@@ -37,7 +37,8 @@ def _run(args: list, timeout: int = 180) -> str:
     except subprocess.TimeoutExpired:
         raise NotebookLMError(f"timeout ({timeout}s): {' '.join(args[:3])}")
     if proc.returncode != 0:
-        raise NotebookLMError(f"CLI error ({proc.returncode}): {proc.stderr.strip()[:300]}")
+        detail = proc.stderr.strip() or proc.stdout.strip() or "(пустой вывод CLI)"
+        raise NotebookLMError(f"CLI error ({proc.returncode}): {detail[:300]}")
     return proc.stdout
 
 
