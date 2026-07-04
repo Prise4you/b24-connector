@@ -1,9 +1,10 @@
 name: B24 → NotebookLM Sync
 
 on:
-  # Вызов из webhook.php при событии в Б24
+  # Вызов из webhook.php при событии в Б24 + ручная полная инвентаризация
+  # NotebookLM-аккаунта из админки (кнопка «Сканировать аккаунт»)
   repository_dispatch:
-    types: [sync_trigger]
+    types: [sync_trigger, full_inventory_trigger]
 
   # Резервное расписание: раз в час (если webhook пропустил событие)
   schedule:
@@ -118,3 +119,42 @@ jobs:
             --status-url https://anitconf.ru/ntlm/api/status.php \
             --connector-token "$CONNECTOR_TOKEN" \
             --crm-only
+
+  # Полная инвентаризация NotebookLM-аккаунта — ТОЛЬКО по ручному запросу
+  # из админки (кнопка «Сканировать аккаунт»), не участвует в плановом/webhook
+  # синке и не зависит от discover/sync.
+  full_inventory:
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'full_inventory_trigger'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Restore NotebookLM session
+        run: |
+          mkdir -p ~/.notebooklm/profiles/default
+          echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
+            > ~/.notebooklm/profiles/default/storage_state.json
+
+      - name: Run full inventory
+        env:
+          NLM_BIN: notebooklm
+          CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
+        run: |
+          python connector.py \
+            --status-url https://anitconf.ru/ntlm/api/status.php \
+            --connector-token "$CONNECTOR_TOKEN" \
+            --full-inventory

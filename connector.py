@@ -1245,9 +1245,28 @@ def main():
     parser.add_argument("--group", type=int, help="Обработать только указанный group_id")
     parser.add_argument("--crm-only", action="store_true",
                          help="Пропустить проекты, синхронизировать только глобальный CRM-блок (для matrix-параллелизации)")
+    parser.add_argument("--full-inventory", action="store_true",
+                         help="Полная инвентаризация аккаунта NotebookLM (list_notebooks) — "
+                              "ТОЛЬКО по ручному запросу из админки, не для расписания/webhook")
     args = parser.parse_args()
 
     connector_token = args.connector_token or os.environ.get("CONNECTOR_TOKEN", "")
+
+    # ── Полная инвентаризация NotebookLM: не трогает Bitrix24/проекты/CRM ────
+    if args.full_inventory:
+        print("→ Полная инвентаризация NotebookLM (весь аккаунт)...")
+        import load_notebooklm
+        notebooks = load_notebooklm.list_notebooks(with_source_counts=True)
+        payload = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            "notebooks_full": notebooks,
+        }
+        if args.status_url and connector_token:
+            post_run_status(args.status_url, connector_token, payload)
+            print(f"✅ Инвентаризация отправлена на {args.status_url}: {len(notebooks)} ноутбуков")
+        else:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
 
     # ── Загрузка конфига (с хостинга или из файла) ────────────────────────────
     _run_start = time.time()
