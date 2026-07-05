@@ -13,38 +13,24 @@ on:
   # Ручной запуск через интерфейс GitHub
   workflow_dispatch:
 
+# КРИТИЧНО: сессию NotebookLM (NLM_STORAGE_STATE) может использовать только
+# ОДИН процесс одновременно — Google инвалидирует её при параллельном
+# использовании с разных IP (защита от угона сессии, проверено на реальных
+# прогонах: matrix-джобы стабильно получали "Authentication expired").
+# Поэтому все job'ы, трогающие NotebookLM, сериализованы этой группой:
+# один прогон работает, следующий ждёт в очереди. НЕ параллелить обратно.
+concurrency:
+  group: nlm-session
+  cancel-in-progress: false
+
 jobs:
-  # Узнаём список проектов из конфига на хостинге, чтобы разложить их по
-  # отдельным параллельным job'ам ниже (matrix). Без этого один процесс
-  # обходил все проекты последовательно и с новыми, более тяжёлыми фичами
-  # (содержимое файлов диска, дедуп, CRM-таймлайн) стал упираться в лимит
-  # времени job'а даже с несколькими проектами сразу.
-  discover:
+  # Один последовательный процесс на все проекты + CRM. Параллельная
+  # matrix-версия (по job'у на проект) откатена — см. комментарий про
+  # concurrency выше. Таймаут 60 мин с запасом на рост числа проектов.
+  sync:
     if: github.event_name != 'repository_dispatch' || github.event.action != 'full_inventory_trigger'
     runs-on: ubuntu-latest
-    outputs:
-      groups: ${{ steps.list.outputs.groups }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - id: list
-        env:
-          CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
-        run: |
-          curl -sS "https://anitconf.ru/ntlm/api/config.php?raw=1" \
-            -H "X-Connector-Token: $CONNECTOR_TOKEN" -o /tmp/cfg_response.txt
-          python3 .github/discover_groups.py /tmp/cfg_response.txt
-
-  sync:
-    needs: discover
-    if: needs.discover.result == 'success' && needs.discover.outputs.groups != '[]'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        group_id: ${{ fromJson(needs.discover.outputs.groups) }}
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -67,10 +53,7 @@ jobs:
           echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
             > ~/.notebooklm/profiles/default/storage_state.json
 
-      - name: Stagger start (избежать конфликта параллельных сессий NotebookLM)
-        run: sleep $(( ${{ strategy.job-index }} * 15 ))
-
-      - name: Run connector (project ${{ matrix.group_id }})
+      - name: Run connector
         env:
           NLM_BIN: notebooklm
           CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
@@ -78,57 +61,16 @@ jobs:
           python connector.py \
             --config-url https://anitconf.ru/ntlm/api/config.php \
             --status-url https://anitconf.ru/ntlm/api/status.php \
-            --connector-token "$CONNECTOR_TOKEN" \
-            --group ${{ matrix.group_id }}
-
-  sync_crm:
-    needs: discover
-    if: needs.discover.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install chromium --with-deps
-
-      - name: Restore NotebookLM session
-        run: |
-          mkdir -p ~/.notebooklm/profiles/default
-          echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
-            > ~/.notebooklm/profiles/default/storage_state.json
-
-      - name: Stagger start (после matrix-джобов проектов)
-        run: sleep 45
-
-      - name: Run connector (CRM only)
-        env:
-          NLM_BIN: notebooklm
-          CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
-        run: |
-          python connector.py \
-            --config-url https://anitconf.ru/ntlm/api/config.php \
-            --status-url https://anitconf.ru/ntlm/api/status.php \
-            --connector-token "$CONNECTOR_TOKEN" \
-            --crm-only
+            --connector-token "$CONNECTOR_TOKEN"
 
   # Полная инвентаризация NotebookLM-аккаунта — ТОЛЬКО по ручному запросу
   # из админки (кнопка «Сканировать аккаунт»), не участвует в плановом/webhook
-  # синке и не зависит от discover/sync.
+  # синке. Та же concurrency-группа (workflow-level) гарантирует, что
+  # инвентаризация не пересечётся с синком по сессии NotebookLM.
   full_inventory:
     if: github.event_name == 'repository_dispatch' && github.event.action == 'full_inventory_trigger'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
