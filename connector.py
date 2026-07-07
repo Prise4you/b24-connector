@@ -567,7 +567,11 @@ def extract_crm_companies(c: B24Client, ids: list) -> list:
     if ids:
         companies = []
         for company_id in ids:
-            raw = c.call("crm.company.get", {"id": company_id, "select": select})
+            try:
+                raw = c.call("crm.company.get", {"id": company_id, "select": select})
+            except Exception as e:
+                print(f"    ⚠️  CRM компания {company_id}: {e} — пропущена")
+                continue
             if raw:
                 companies.append(raw)
     else:
@@ -585,7 +589,11 @@ def extract_crm_contacts(c: B24Client, ids: list) -> list:
     if ids:
         contacts = []
         for contact_id in ids:
-            raw = c.call("crm.contact.get", {"id": contact_id, "select": select})
+            try:
+                raw = c.call("crm.contact.get", {"id": contact_id, "select": select})
+            except Exception as e:
+                print(f"    ⚠️  CRM контакт {contact_id}: {e} — пропущен")
+                continue
             if raw:
                 contacts.append(raw)
     else:
@@ -1380,6 +1388,7 @@ def main():
             print("\n→ Первый запуск --poll: полная пересборка")
 
     secrets_grand_total = 0
+    project_errors = []
 
     # ── Проекты ───────────────────────────────────────────────────────────────
     for idx, proj in enumerate(projects):
@@ -1387,138 +1396,145 @@ def main():
             continue
         if args.group and int(proj["group_id"]) != args.group:
             continue
-        group_id   = int(proj["group_id"])
-        group_name = _get_group_name(c, group_id)
-        # Заголовок ноутбука: явное название из админ-панели имеет приоритет
-        # над именем группы Б24; источники — per-project с фолбэком на include.
-        nb_title = (proj.get("notebook_name") or "").strip() or group_name
-        src      = proj.get("sources") or {}
-        def _want(key):
-            return src.get(key, inc.get(key, True))
-        proj_dir   = str(Path(out_dir) / f"project_{group_id}")
-        print(f"\n{'═'*50}")
-        print(f"ПРОЕКТ: {group_name} (group_id={group_id})")
+        try:
+            group_id   = int(proj["group_id"])
+            group_name = _get_group_name(c, group_id)
+            # Заголовок ноутбука: явное название из админ-панели имеет приоритет
+            # над именем группы Б24; источники — per-project с фолбэком на include.
+            nb_title = (proj.get("notebook_name") or "").strip() or group_name
+            src      = proj.get("sources") or {}
+            def _want(key):
+                return src.get(key, inc.get(key, True))
+            proj_dir   = str(Path(out_dir) / f"project_{group_id}")
+            print(f"\n{'═'*50}")
+            print(f"ПРОЕКТ: {group_name} (group_id={group_id})")
 
-        docs = {}
-        chat_messages_for_audio = []
-        disk_binary_attachments = []
+            docs = {}
+            chat_messages_for_audio = []
+            disk_binary_attachments = []
 
-        if _want("tasks"):
-            print("\n→ Задачи")
-            tasks = extract_tasks_full(c, group_id)
-            comments = extract_comments_bulk(c, [t["id"] for t in tasks]) if _want("task_comments") else None
-            docs["tasks.md"] = build_tasks_doc(tasks, group_name, c, comments)
+            if _want("tasks"):
+                print("\n→ Задачи")
+                tasks = extract_tasks_full(c, group_id)
+                comments = extract_comments_bulk(c, [t["id"] for t in tasks]) if _want("task_comments") else None
+                docs["tasks.md"] = build_tasks_doc(tasks, group_name, c, comments)
 
-        if _want("group_chat"):
-            print("\n→ Чат группы")
-            dialog, messages = extract_group_chat(c, group_id)
-            if dialog or messages:
-                docs["chat.md"] = build_chat_doc(dialog, messages, group_name)
-                chat_messages_for_audio = messages
+            if _want("group_chat"):
+                print("\n→ Чат группы")
+                dialog, messages = extract_group_chat(c, group_id)
+                if dialog or messages:
+                    docs["chat.md"] = build_chat_doc(dialog, messages, group_name)
+                    chat_messages_for_audio = messages
 
-        if _want("disk_files"):
-            print("\n→ Файлы диска")
-            files = extract_disk_files(c, group_id)
-            if files:
-                disk_limit = int(proj.get("disk_files_limit", cfg.get("disk_files_limit", 15)))
-                text_docs, disk_binary_attachments, inline_sections = prepare_disk_attachments(
-                    c, files, group_name, proj_dir, limit=disk_limit)
-                docs.update(text_docs)
-                docs["files.md"] = build_files_doc(files, group_name, inline_sections)
+            if _want("disk_files"):
+                print("\n→ Файлы диска")
+                files = extract_disk_files(c, group_id)
+                if files:
+                    disk_limit = int(proj.get("disk_files_limit", cfg.get("disk_files_limit", 15)))
+                    text_docs, disk_binary_attachments, inline_sections = prepare_disk_attachments(
+                        c, files, group_name, proj_dir, limit=disk_limit)
+                    docs.update(text_docs)
+                    docs["files.md"] = build_files_doc(files, group_name, inline_sections)
 
-        _raw_chats = list(proj.get("chats") or [])
-        _ol_ids = [str(ol["id"]) for ol in (proj.get("open_lines_data") or [])
-                   if isinstance(ol, dict) and ol.get("id")]
-        _seen = set(str(x) for x in _raw_chats)
-        for chat_id in _raw_chats + [x for x in _ol_ids if x not in _seen]:
-            print(f"\n→ Чат {chat_id}")
-            try:
-                messages = _get_chat_messages(c, chat_id)
-                print(f"    Сообщений: {len(messages)}")
-                if messages:
-                    docs[f"chat_{chat_id}.md"] = build_specific_chat_doc(messages, chat_id, group_name)
-                    chat_messages_for_audio.extend(messages)
-            except B24Error as e:
-                print(f"  ❌ Ошибка чата {chat_id}: {e}")
+            _raw_chats = list(proj.get("chats") or [])
+            _ol_ids = [str(ol["id"]) for ol in (proj.get("open_lines_data") or [])
+                       if isinstance(ol, dict) and ol.get("id")]
+            _seen = set(str(x) for x in _raw_chats)
+            for chat_id in _raw_chats + [x for x in _ol_ids if x not in _seen]:
+                print(f"\n→ Чат {chat_id}")
+                try:
+                    messages = _get_chat_messages(c, chat_id)
+                    print(f"    Сообщений: {len(messages)}")
+                    if messages:
+                        docs[f"chat_{chat_id}.md"] = build_specific_chat_doc(messages, chat_id, group_name)
+                        chat_messages_for_audio.extend(messages)
+                except B24Error as e:
+                    print(f"  ❌ Ошибка чата {chat_id}: {e}")
 
-        # ── Per-project CRM (точечно по ID компаний) ──────────────────────────
-        # Новый формат: src["crm"] = {company_ids, contacts, deals, smart}.
-        # Старый формат (crm_companies/crm_contacts/... = «выгрузить всё») больше
-        # не поддерживается — CRM выгружается только если заданы company_ids.
-        crm_src = src.get("crm")
-        proj_company_ids = []
-        if isinstance(crm_src, dict):
-            proj_company_ids = [str(x) for x in (crm_src.get("company_ids") or []) if x]
+            # ── Per-project CRM (точечно по ID компаний) ──────────────────────────
+            # Новый формат: src["crm"] = {company_ids, contacts, deals, smart}.
+            # Старый формат (crm_companies/crm_contacts/... = «выгрузить всё») больше
+            # не поддерживается — CRM выгружается только если заданы company_ids.
+            crm_src = src.get("crm")
+            proj_company_ids = []
+            if isinstance(crm_src, dict):
+                proj_company_ids = [str(x) for x in (crm_src.get("company_ids") or []) if x]
 
-        if proj_company_ids:
-            print(f"\n→ CRM по компаниям: {', '.join(proj_company_ids)}")
-            companies = extract_crm_companies(c, proj_company_ids)
-            if companies:
-                docs["crm_companies.md"] = build_crm_companies_doc(companies)
+            if proj_company_ids:
+                print(f"\n→ CRM по компаниям: {', '.join(proj_company_ids)}")
+                companies = extract_crm_companies(c, proj_company_ids)
+                if companies:
+                    docs["crm_companies.md"] = build_crm_companies_doc(companies)
 
-            if crm_src.get("contacts"):
-                contacts = extract_crm_contacts_by_company(c, proj_company_ids)
-                if contacts:
-                    docs["crm_contacts.md"] = build_crm_contacts_doc(contacts)
+                if crm_src.get("contacts"):
+                    contacts = extract_crm_contacts_by_company(c, proj_company_ids)
+                    if contacts:
+                        docs["crm_contacts.md"] = build_crm_contacts_doc(contacts)
 
-            if crm_src.get("deals"):
-                deals = extract_crm_deals(c, proj_company_ids)
-                if deals:
-                    docs["crm_deals.md"] = build_crm_deals_doc(deals)
+                if crm_src.get("deals"):
+                    deals = extract_crm_deals(c, proj_company_ids)
+                    if deals:
+                        docs["crm_deals.md"] = build_crm_deals_doc(deals)
 
-            if crm_src.get("smart"):
-                smart = extract_crm_smart(c, proj_company_ids)
-                if smart:
-                    docs["crm_smart.md"] = build_crm_smart_doc(smart)
+                if crm_src.get("smart"):
+                    smart = extract_crm_smart(c, proj_company_ids)
+                    if smart:
+                        docs["crm_smart.md"] = build_crm_smart_doc(smart)
 
-            if crm_src.get("timeline"):
-                company_names = {str(co["ID"]): (co.get("TITLE") or f"Компания #{co['ID']}")
-                                  for co in companies} if companies else {}
-                entities = [{"type": "company", "id": cid,
-                             "name": company_names.get(str(cid), f"Компания #{cid}")}
-                            for cid in proj_company_ids]
-                timeline_comments = extract_crm_timeline(c, entities)
-                timeline_activities = extract_crm_activities(c, entities)
-                if timeline_comments or timeline_activities:
-                    docs["crm_timeline.md"] = build_crm_timeline_doc(
-                        timeline_comments, timeline_activities)
+                if crm_src.get("timeline"):
+                    company_names = {str(co["ID"]): (co.get("TITLE") or f"Компания #{co['ID']}")
+                                      for co in companies} if companies else {}
+                    entities = [{"type": "company", "id": cid,
+                                 "name": company_names.get(str(cid), f"Компания #{cid}")}
+                                for cid in proj_company_ids]
+                    timeline_comments = extract_crm_timeline(c, entities)
+                    timeline_activities = extract_crm_activities(c, entities)
+                    if timeline_comments or timeline_activities:
+                        docs["crm_timeline.md"] = build_crm_timeline_doc(
+                            timeline_comments, timeline_activities)
 
-        redacted, n_secrets = _redact_and_save(docs, proj_dir)
-        secrets_grand_total += n_secrets
-        security.audit_run_end(redacted, n_secrets)
+            redacted, n_secrets = _redact_and_save(docs, proj_dir)
+            secrets_grand_total += n_secrets
+            security.audit_run_end(redacted, n_secrets)
 
-        if not args.dry_run and nlm_on:
-            print(f"\n→ Загрузка в NotebookLM [{nb_title}]")
-            try:
-                import load_notebooklm
-                nb_id = proj.get("notebook_id", "")
-                new_id = load_notebooklm.load_to_notebooklm(
-                    proj_dir, nb_id, nb_title, list(redacted.keys()),
-                    dedupe_mode=dedupe_mode)
-                if new_id and new_id != nb_id:
-                    cfg["projects"][idx]["notebook_id"] = new_id
-                    if args.config_url and connector_token:
-                        try:
-                            push_notebook_id_patch(args.config_url, connector_token,
-                                                    "project", new_id, group_id=group_id)
-                            print("  Конфиг обновлён на хостинге")
-                        except Exception as e:
-                            print(f"  ⚠️  Не удалось сохранить конфиг на хостинге ({e})")
-                    else:
-                        save_config(cfg, args, connector_token)
-                print(f"✅ NotebookLM: https://notebooklm.google.com/notebook/{new_id}")
-                # Аудио из чата группы
-                if chat_messages_for_audio:
-                    print("  → Аудиофайлы из чата группы")
-                    audio_dir = str(Path(proj_dir) / "audio")
-                    audio_list = download_audio_from_messages(chat_messages_for_audio, audio_dir)
-                    if audio_list:
-                        load_notebooklm.upload_files(new_id, audio_list)
-                if disk_binary_attachments:
-                    print("  → Файлы диска as-is (PDF/изображения)")
-                    load_notebooklm.upload_files(new_id, disk_binary_attachments)
-            except Exception as e:
-                print(f"❌ NotebookLM: {e}")
+            if not args.dry_run and nlm_on:
+                print(f"\n→ Загрузка в NotebookLM [{nb_title}]")
+                try:
+                    import load_notebooklm
+                    nb_id = proj.get("notebook_id", "")
+                    new_id = load_notebooklm.load_to_notebooklm(
+                        proj_dir, nb_id, nb_title, list(redacted.keys()),
+                        dedupe_mode=dedupe_mode)
+                    if new_id and new_id != nb_id:
+                        cfg["projects"][idx]["notebook_id"] = new_id
+                        if args.config_url and connector_token:
+                            try:
+                                push_notebook_id_patch(args.config_url, connector_token,
+                                                        "project", new_id, group_id=group_id)
+                                print("  Конфиг обновлён на хостинге")
+                            except Exception as e:
+                                print(f"  ⚠️  Не удалось сохранить конфиг на хостинге ({e})")
+                        else:
+                            save_config(cfg, args, connector_token)
+                    print(f"✅ NotebookLM: https://notebooklm.google.com/notebook/{new_id}")
+                    # Аудио из чата группы
+                    if chat_messages_for_audio:
+                        print("  → Аудиофайлы из чата группы")
+                        audio_dir = str(Path(proj_dir) / "audio")
+                        audio_list = download_audio_from_messages(chat_messages_for_audio, audio_dir)
+                        if audio_list:
+                            load_notebooklm.upload_files(new_id, audio_list)
+                    if disk_binary_attachments:
+                        print("  → Файлы диска as-is (PDF/изображения)")
+                        load_notebooklm.upload_files(new_id, disk_binary_attachments)
+                except Exception as e:
+                    print(f"❌ NotebookLM: {e}")
+        except Exception as e:
+            gid = int(proj.get("group_id", 0))
+            gname = (proj.get("notebook_name") or "").strip() or f"group {gid}"
+            print(f"\n❌ ПРОЕКТ {gname} (group_id={gid}): {e}")
+            project_errors.append({"group_id": gid, "name": gname, "error": str(e)})
+            continue
 
     # ── CRM (только при полном прогоне, не при --group) ───────────────────────
     crm_cfg = inc.get("crm", {})
@@ -1602,10 +1618,11 @@ def main():
         payload = {
             "ts":             now_iso,
             "mode":           "dry-run" if args.dry_run else ("poll" if args.poll else "full"),
-            "status":         "ok",
+            "status":         "partial" if project_errors else "ok",
             "secrets_found":  secrets_grand_total,
             "elapsed_sec":    elapsed,
             "group":          args.group,
+            "partial_errors": project_errors,
         }
         # Снимок NotebookLM: статус сессии + число источников по ИЗВЕСТНЫМ
         # ноутбукам проектов (не весь аккаунт NotebookLM — там могут быть
