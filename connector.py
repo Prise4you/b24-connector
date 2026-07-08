@@ -1389,6 +1389,8 @@ def main():
 
     secrets_grand_total = 0
     project_errors = []
+    nlm_errors = []          # сбои загрузки в NotebookLM (по проектам)
+    nlm_session_dead = False  # сессия NotebookLM истекла — дальше не пытаться
 
     # ── Проекты ───────────────────────────────────────────────────────────────
     for idx, proj in enumerate(projects):
@@ -1497,7 +1499,15 @@ def main():
             secrets_grand_total += n_secrets
             security.audit_run_end(redacted, n_secrets)
 
-            if not args.dry_run and nlm_on:
+            if not args.dry_run and nlm_on and nlm_session_dead:
+                # Сессия NotebookLM уже подтверждённо истекла на одном из
+                # предыдущих проектов — нет смысла молотить ×3 ретрая на
+                # каждый оставшийся проект (это и есть те ~53 минуты впустую).
+                # Б24-выгрузка/redact для этого проекта уже отработали.
+                print(f"\n→ NotebookLM [{nb_title}]: пропуск — сессия истекла (см. выше)")
+                nlm_errors.append({"group_id": group_id, "name": nb_title,
+                                   "error": "сессия NotebookLM истекла — пропущено"})
+            elif not args.dry_run and nlm_on:
                 print(f"\n→ Загрузка в NotebookLM [{nb_title}]")
                 try:
                     import load_notebooklm
@@ -1529,6 +1539,20 @@ def main():
                         load_notebooklm.upload_files(new_id, disk_binary_attachments)
                 except Exception as e:
                     print(f"❌ NotebookLM: {e}")
+                    # Ошибка загрузки в NotebookLM больше не «глотается» молча:
+                    # раньше она только печаталась и НЕ влияла на статус прогона,
+                    # из-за чего провал загрузки во все ноутбуки рапортовался как
+                    # "ok". Теперь копим её в nlm_errors → статус partial/error.
+                    nlm_errors.append({"group_id": group_id, "name": nb_title,
+                                       "error": str(e)})
+                    # Истёкшая сессия Google одинаково завалит все остальные
+                    # проекты — взводим флаг, дальше пропускаем NLM-загрузку.
+                    if any(m in str(e) for m in
+                           ("Authentication expired", "UNEXPECTED_ERROR",
+                            "notebooklm login", "accounts.google.com")):
+                        nlm_session_dead = True
+                        print("  ⚠️  Сессия NotebookLM истекла — остальные проекты "
+                              "пропущу, нужен свежий notebooklm login")
         except Exception as e:
             gid = int(proj.get("group_id", 0))
             gname = (proj.get("notebook_name") or "").strip() or f"group {gid}"
@@ -1615,15 +1639,30 @@ def main():
 
     # ── POST статуса на хостинг ───────────────────────────────────────────────
     if args.status_url and connector_token:
+        # Статус прогона учитывает и падения проектов (project_errors), и сбои
+        # загрузки в NotebookLM (nlm_errors). Истёкшая сессия NotebookLM —
+        # это "error" (ничего не залилось, нужно вмешательство: notebooklm
+        # login). Прочие частичные сбои — "partial". Полностью чисто — "ok".
+        all_errors = project_errors + nlm_errors
+        if nlm_session_dead:
+            run_status = "error"
+        elif all_errors:
+            run_status = "partial"
+        else:
+            run_status = "ok"
         payload = {
             "ts":             now_iso,
             "mode":           "dry-run" if args.dry_run else ("poll" if args.poll else "full"),
-            "status":         "partial" if project_errors else "ok",
+            "status":         run_status,
             "secrets_found":  secrets_grand_total,
             "elapsed_sec":    elapsed,
             "group":          args.group,
-            "partial_errors": project_errors,
+            "partial_errors": all_errors,
         }
+        if nlm_session_dead:
+            payload["error"] = ("Сессия NotebookLM истекла — источники не "
+                                "загружены. Нужен свежий notebooklm login "
+                                "и обновление секрета NLM_STORAGE_STATE.")
         # Снимок NotebookLM: статус сессии + число источников по ИЗВЕСТНЫМ
         # ноутбукам проектов (не весь аккаунт NotebookLM — там могут быть
         # десятки посторонних личных ноутбуков, и опрос каждого из них по

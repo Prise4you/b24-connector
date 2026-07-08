@@ -292,16 +292,31 @@ def project_notebooks_snapshot(known: list) -> list:
 def session_status(storage_path: Optional[str] = None,
                    max_age_hours: int = 24) -> dict:
     """
-    Свежесть сессии NotebookLM по mtime storage_state.json.
-    Возвращает {ok: bool, date: iso|None}. Эвристика (не гарантирует валидность токена).
+    Реальный статус сессии NotebookLM.
+    Возвращает {ok: bool, date: iso|None}.
+
+    Раньше это была эвристика по mtime storage_state.json («свежий файл = ok»),
+    из-за чего панель показывала nlm_session.ok=true даже при истёкшем токене
+    (реальный инцидент: все проекты падали с Authentication expired, а прогон
+    рапортовал зелёный ok). Теперь делаем лёгкий реальный вызов CLI (`list`) и
+    определяем ok по факту: если CLI вернул UNEXPECTED_ERROR/Authentication
+    expired — сессия мертва. mtime отдаём как справочную дату.
     """
     p = Path(storage_path or DEFAULT_STORAGE)
     if not p.exists():
         return {"ok": False, "date": None}
     mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
-    age_h = (datetime.now(timezone.utc) - mtime).total_seconds() / 3600
-    return {"ok": age_h <= max_age_hours,
-            "date": mtime.strftime("%Y-%m-%dT%H:%M:%S")}
+    date_str = mtime.strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        out = _run(["list", "--json"], timeout=60)
+        # CLI при мёртвой сессии печатает JSON с error:true и code
+        # UNEXPECTED_ERROR (exit 0), поэтому проверяем и содержимое.
+        dead = any(m in out for m in ("Authentication expired", "UNEXPECTED_ERROR"))
+        return {"ok": not dead, "date": date_str}
+    except NotebookLMError as e:
+        # Ошибка (в т.ч. auth-expired через ненулевой код, таймаут, сеть) —
+        # честнее вернуть ok:false, чем эвристический «свежий файл = ok».
+        return {"ok": False, "date": date_str}
 
 
 def load_to_notebooklm(docs_dir: str, notebook_id: str,
