@@ -1691,7 +1691,18 @@ def main():
                 crm_nb_id = snapshot_cfg.get("include", {}).get("crm", {}).get("notebook_id")
                 if crm_nb_id:
                     known_notebooks.append({"id": crm_nb_id, "name": "CRM АНИТ"})
-                payload["notebooks"] = load_notebooklm.project_notebooks_snapshot(known_notebooks)
+                if nlm_session_dead or not payload["nlm_session"].get("ok"):
+                    # Сессия уже подтверждённо мертва — не тратить время на N
+                    # обречённых CLI-вызовов подряд (каждый всё равно вернёт
+                    # ошибку). Честно сообщаем "не удалось узнать" (None),
+                    # а не ложный "0 источников" — реальный контент, залитый
+                    # в прошлых успешных прогонах, никуда не делся.
+                    payload["notebooks"] = [
+                        {"id": nb["id"], "name": nb["name"], "sources": None}
+                        for nb in known_notebooks
+                    ]
+                else:
+                    payload["notebooks"] = load_notebooklm.project_notebooks_snapshot(known_notebooks)
             except Exception as e:
                 print(f"  ⚠️  Снимок NotebookLM не собран: {e}")
         print(f"\n→ Отправляю статус на {args.status_url} ...")

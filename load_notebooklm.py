@@ -155,21 +155,27 @@ def upload_files(notebook_id: str, file_list: list) -> None:
         upload_doc(notebook_id, file_path, title)
 
 
-def _list_sources(notebook_id: str) -> list:
-    """Сырой список источников ноутбука: [{id, title, created_at}, ...]."""
+def _list_sources(notebook_id: str) -> Optional[list]:
+    """
+    Сырой список источников ноутбука: [{id, title, created_at}, ...].
+    None — если запрос не удался (например, сессия NotebookLM истекла) —
+    это НЕ то же самое, что реально пустой ноутбук ([]). Раньше оба случая
+    схлопывались в один и тот же [], из-за чего мёртвая сессия рапортовала
+    ложные "0 источников" вместо честного "не удалось узнать".
+    """
     try:
         out = _run(["source", "list", "-n", notebook_id, "--json"], timeout=60)
         data = json.loads(out)
         srcs = data.get("sources") if isinstance(data, dict) else data
         return srcs if isinstance(srcs, list) else []
     except (NotebookLMError, json.JSONDecodeError):
-        return []
+        return None
 
 
 def _count_sources(notebook_id: str) -> Optional[int]:
     """Число источников в ноутбуке. None — если не удалось определить."""
     srcs = _list_sources(notebook_id)
-    return len(srcs) if srcs else (0 if srcs == [] else None)
+    return None if srcs is None else len(srcs)
 
 
 def dedupe_sources(notebook_id: str, expected_titles: set, group_prefix: str,
@@ -185,7 +191,7 @@ def dedupe_sources(notebook_id: str, expected_titles: set, group_prefix: str,
     Возвращает {"duplicates": [...], "ghosts": [...], "dry_run": bool} —
     списки title, которые были (или были бы) затронуты.
     """
-    sources = _list_sources(notebook_id)
+    sources = _list_sources(notebook_id) or []
     by_title = {}
     for s in sources:
         by_title.setdefault(s.get("title", ""), []).append(s)
