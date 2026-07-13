@@ -47,7 +47,10 @@ jobs:
           pip install -r requirements.txt
           playwright install chromium --with-deps
 
-      - name: Restore NotebookLM session
+      # Seed: восстановить сессию из секрета на случай холодного старта (нет
+      # живой копии на хостинге). Коннектор дальше сам предпочтёт живую копию
+      # с --nlm-session-url, если она есть, и сохранит ротированную обратно.
+      - name: Restore NotebookLM session (seed)
         run: |
           mkdir -p ~/.notebooklm/profiles/default
           echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
@@ -61,6 +64,7 @@ jobs:
           python connector.py \
             --config-url https://anitconf.ru/ntlm/api/config.php \
             --status-url https://anitconf.ru/ntlm/api/status.php \
+            --nlm-session-url https://anitconf.ru/ntlm/api/nlm_session.php \
             --connector-token "$CONNECTOR_TOKEN"
 
   # Полная инвентаризация NotebookLM-аккаунта — ТОЛЬКО по ручному запросу
@@ -87,7 +91,7 @@ jobs:
           pip install -r requirements.txt
           playwright install chromium --with-deps
 
-      - name: Restore NotebookLM session
+      - name: Restore NotebookLM session (seed)
         run: |
           mkdir -p ~/.notebooklm/profiles/default
           echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
@@ -100,5 +104,6 @@ jobs:
         run: |
           python connector.py \
             --status-url https://anitconf.ru/ntlm/api/status.php \
+            --nlm-session-url https://anitconf.ru/ntlm/api/nlm_session.php \
             --connector-token "$CONNECTOR_TOKEN" \
             --full-inventory

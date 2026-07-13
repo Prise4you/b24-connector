@@ -114,6 +114,85 @@ def push_notebook_id_patch(url: str, token: str, kind: str, notebook_id: str,
         resp.read()
 
 
+def fetch_remote_nlm_session(url: str, token: str) -> Optional[str]:
+    """
+    Скачать живую копию сессии NotebookLM с хостинга (GET, X-Connector-Token).
+    Возвращает base64 содержимого storage_state.json или None, если ещё не
+    засеяна. Живая копия важнее seed'а из секрета NLM_STORAGE_STATE: она
+    ротируется keepalive'ом каждый прогон, а секрет — только холодный старт.
+    """
+    req = urllib.request.Request(url, headers={"X-Connector-Token": token})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+    b64 = data.get("state_b64")
+    return b64 if isinstance(b64, str) and b64.strip() else None
+
+
+def push_remote_nlm_session(url: str, token: str, state_b64: str) -> None:
+    """
+    Сохранить ротированную сессию NotebookLM обратно на хостинг (POST). Так
+    цепочка cookie __Secure-1PSIDTS живёт непрерывно между эфемерными прогонами
+    GitHub Actions — иначе замороженный снимок протухает после первого же
+    использования (Google ротирует PSIDTS при каждом обращении).
+    """
+    body = json.dumps({"state_b64": state_b64}, ensure_ascii=False).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json", "X-Connector-Token": token},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
+def restore_nlm_session(url: str, token: str) -> bool:
+    """
+    В начале прогона: если на хостинге есть живая копия сессии — записать её в
+    DEFAULT_STORAGE поверх seed'а из секрета. Возвращает True, если восстановил.
+    """
+    import base64, load_notebooklm
+    try:
+        b64 = fetch_remote_nlm_session(url, token)
+    except Exception as e:
+        print(f"  ⚠️  Не удалось получить живую сессию NotebookLM с хостинга ({e}), использую seed из секрета")
+        return False
+    if not b64:
+        print("  ℹ️  На хостинге ещё нет живой сессии NotebookLM — использую seed из секрета (холодный старт)")
+        return False
+    try:
+        raw = base64.b64decode(b64)
+        dst = Path(load_notebooklm.DEFAULT_STORAGE)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(raw)
+        os.chmod(dst, 0o600)
+        print("  ✅ Живая сессия NotebookLM восстановлена с хостинга")
+        return True
+    except Exception as e:
+        print(f"  ⚠️  Не удалось записать живую сессию NotebookLM ({e}), использую seed из секрета")
+        return False
+
+
+def persist_nlm_session(url: str, token: str) -> None:
+    """
+    В конце прогона: прочитать актуальный (ротированный keepalive'ом за время
+    прогона) DEFAULT_STORAGE и сохранить обратно на хостинг. Вызывать ТОЛЬКО
+    если сессия жива — иначе затрём последнюю живую копию мусором мёртвого
+    токена.
+    """
+    import base64, load_notebooklm
+    try:
+        src = Path(load_notebooklm.DEFAULT_STORAGE)
+        if not src.exists():
+            print("  ⚠️  DEFAULT_STORAGE не найден — нечего сохранять на хостинг")
+            return
+        raw = src.read_bytes()
+        b64 = base64.b64encode(raw).decode()
+        push_remote_nlm_session(url, token, b64)
+        print("  ✅ Ротированная сессия NotebookLM сохранена на хостинг")
+    except Exception as e:
+        print(f"  ⚠️  Не удалось сохранить сессию NotebookLM на хостинг ({e})")
+
+
 def save_config(cfg: dict, args, connector_token: str) -> None:
     """
     Сохранить изменённый конфиг там, откуда он был загружен: на хостинг
@@ -1246,6 +1325,7 @@ def main():
     parser.add_argument("--config-url",     default="", help="URL /api/config.php на хостинге")
     parser.add_argument("--status-url",     default="", help="URL /api/status.php на хостинге")
     parser.add_argument("--connector-token", default="", help="X-Connector-Token (или задать CONNECTOR_TOKEN=...)")
+    parser.add_argument("--nlm-session-url", default="", help="URL /api/nlm_session.php — живая самообновляющаяся сессия NotebookLM")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-admin-check", action="store_true")
     parser.add_argument("--bind", action="store_true")
@@ -1259,6 +1339,16 @@ def main():
     args = parser.parse_args()
 
     connector_token = args.connector_token or os.environ.get("CONNECTOR_TOKEN", "")
+    nlm_session_url = args.nlm_session_url or os.environ.get("NLM_SESSION_URL", "")
+
+    # ── Живая сессия NotebookLM: восстановить с хостинга поверх seed'а ────────
+    # Секрет NLM_STORAGE_STATE (восстановленный workflow'ом в DEFAULT_STORAGE) —
+    # только холодный старт. Живая копия на хостинге ротируется каждый прогон,
+    # поэтому она приоритетнее. Делать ДО первого обращения к NLM (в т.ч.
+    # full_inventory).
+    if nlm_session_url and connector_token:
+        print(f"→ Восстанавливаю живую сессию NotebookLM с {nlm_session_url} ...")
+        restore_nlm_session(nlm_session_url, connector_token)
 
     # ── Полная инвентаризация NotebookLM: не трогает Bitrix24/проекты/CRM ────
     if args.full_inventory:
@@ -1274,6 +1364,10 @@ def main():
             print(f"✅ Инвентаризация отправлена на {args.status_url}: {len(notebooks)} ноутбуков")
         else:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
+        # Инвентаризация тоже ротирует сессию — сохранить свежую копию на хостинг,
+        # если получили непустой список (список пуст = сессия скорее мертва).
+        if nlm_session_url and connector_token and notebooks:
+            persist_nlm_session(nlm_session_url, connector_token)
         return
 
     # ── Загрузка конфига (с хостинга или из файла) ────────────────────────────
@@ -1707,6 +1801,22 @@ def main():
                 print(f"  ⚠️  Снимок NotebookLM не собран: {e}")
         print(f"\n→ Отправляю статус на {args.status_url} ...")
         post_run_status(args.status_url, connector_token, payload)
+
+    # ── Сохранить ротированную сессию NotebookLM обратно на хостинг ───────────
+    # Только на реальном (не dry-run) прогоне и только если сессия жива — иначе
+    # затрём последнюю живую копию мусором мёртвого токена. Это и есть механизм
+    # самообновления: keepalive ротировал cookie за время прогона, сохраняем
+    # свежий storage_state, следующий часовой прогон возьмёт его.
+    if (nlm_session_url and connector_token and nlm_on and not args.dry_run
+            and not nlm_session_dead):
+        try:
+            import load_notebooklm
+            if load_notebooklm.session_status().get("ok"):
+                persist_nlm_session(nlm_session_url, connector_token)
+            else:
+                print("  ⚠️  Сессия NotebookLM не подтверждена живой — не сохраняю на хостинг")
+        except Exception as e:
+            print(f"  ⚠️  Проверка сессии перед сохранением не удалась ({e}) — не сохраняю")
 
     if args.dry_run:
         print(f"\n[dry-run] Готово. Секретов замаскировано: {secrets_grand_total}. Время: {elapsed}s")
