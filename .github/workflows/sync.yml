@@ -26,11 +26,16 @@ concurrency:
 jobs:
   # Один последовательный процесс на все проекты + CRM. Параллельная
   # matrix-версия (по job'у на проект) откатена — см. комментарий про
-  # concurrency выше. Таймаут 60 мин с запасом на рост числа проектов.
+  # concurrency выше. Таймаут поднят с 60 до 90 мин: реальный прогон
+  # (2026-07-13, 10 проектов + CRM-динамика/timeline/activities) уложился
+  # в 60 мин впритык и один раз был убит по таймауту на 9-м из 10 проектов —
+  # это КРИТИЧНО для самообновляющейся сессии (persist_nlm_session вызывается
+  # только в самом конце main(), после всех проектов; не дойдя до конца,
+  # ротированная сессия никогда не сохранится на хостинг).
   sync:
     if: github.event_name != 'repository_dispatch' || github.event.action != 'full_inventory_trigger'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout

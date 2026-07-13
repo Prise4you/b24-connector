@@ -1632,6 +1632,15 @@ def main():
                     if disk_binary_attachments:
                         print("  → Файлы диска as-is (PDF/изображения)")
                         load_notebooklm.upload_files(new_id, disk_binary_attachments)
+                    # Персист ротированной сессии после КАЖДОГО успешного проекта,
+                    # не только в самом конце main(): полный прогон по 10 проектам
+                    # + CRM-динамике вплотную подходит к таймауту job'а — если
+                    # раннер будет убит по timeout ДО конца скрипта, финальный
+                    # персист не выполнится вообще, и самообновление не сработает.
+                    # Дешёвая операция (файл + POST, без вызова CLI) — не жалко
+                    # делать на каждом проекте.
+                    if nlm_session_url and connector_token:
+                        persist_nlm_session(nlm_session_url, connector_token)
                 except Exception as e:
                     print(f"❌ NotebookLM: {e}")
                     # Ошибка загрузки в NotebookLM больше не «глотается» молча:
