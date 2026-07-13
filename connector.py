@@ -25,6 +25,7 @@ import argparse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 from b24_client import B24Client, B24Error
