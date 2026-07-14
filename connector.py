@@ -194,6 +194,19 @@ def persist_nlm_session(url: str, token: str) -> None:
         print(f"  ⚠️  Не удалось сохранить сессию NotebookLM на хостинг ({e})")
 
 
+def _persist_session_quiet(url: str, token: str) -> None:
+    """
+    Тихий persist для хука непрерывного зеркалирования (load_notebooklm._run
+    зовёт его после каждого успешного CLI-вызова, если storage_state изменился).
+    БЕЗ print (иначе +100 строк в лог за прогон) и ПОДНИМАЕТ исключение при сбое —
+    load_notebooklm._maybe_persist_session сам поймает и не сдвинет baseline,
+    чтобы повторить на следующем вызове. Итог выводится один раз в конце прогона.
+    """
+    import base64, load_notebooklm
+    raw = Path(load_notebooklm.DEFAULT_STORAGE).read_bytes()
+    push_remote_nlm_session(url, token, base64.b64encode(raw).decode())
+
+
 def save_config(cfg: dict, args, connector_token: str) -> None:
     """
     Сохранить изменённый конфиг там, откуда он был загружен: на хостинг
@@ -1350,6 +1363,18 @@ def main():
     if nlm_session_url and connector_token:
         print(f"→ Восстанавливаю живую сессию NotebookLM с {nlm_session_url} ...")
         restore_nlm_session(nlm_session_url, connector_token)
+        # Непрерывное зеркалирование: load_notebooklm._run после каждого
+        # успешного CLI-вызова, если storage_state изменился (ротация PSIDTS),
+        # POST'ит его на хостинг. Так хостинг-копия отстаёт от диска раннера
+        # максимум на один вызов — таймаут/сбой почти не рвут цепочку.
+        import load_notebooklm
+        try:
+            load_notebooklm._last_persist_mtime = os.path.getmtime(
+                load_notebooklm.DEFAULT_STORAGE)  # baseline: сам restore не триггерит
+        except OSError:
+            pass
+        load_notebooklm.SESSION_PERSIST_HOOK = (
+            lambda: _persist_session_quiet(nlm_session_url, connector_token))
 
     # ── Полная инвентаризация NotebookLM: не трогает Bitrix24/проекты/CRM ────
     if args.full_inventory:
@@ -1632,15 +1657,10 @@ def main():
                     if disk_binary_attachments:
                         print("  → Файлы диска as-is (PDF/изображения)")
                         load_notebooklm.upload_files(new_id, disk_binary_attachments)
-                    # Персист ротированной сессии после КАЖДОГО успешного проекта,
-                    # не только в самом конце main(): полный прогон по 10 проектам
-                    # + CRM-динамике вплотную подходит к таймауту job'а — если
-                    # раннер будет убит по timeout ДО конца скрипта, финальный
-                    # персист не выполнится вообще, и самообновление не сработает.
-                    # Дешёвая операция (файл + POST, без вызова CLI) — не жалко
-                    # делать на каждом проекте.
-                    if nlm_session_url and connector_token:
-                        persist_nlm_session(nlm_session_url, connector_token)
+                    # Персист сессии здесь НЕ нужен: непрерывный хук
+                    # (load_notebooklm.SESSION_PERSIST_HOOK) уже зеркалирует
+                    # storage_state на хостинг после каждого CLI-вызова, что
+                    # покрывает и этот момент, и все промежуточные ротации.
                 except Exception as e:
                     print(f"❌ NotebookLM: {e}")
                     # Ошибка загрузки в NotebookLM больше не «глотается» молча:
@@ -1825,6 +1845,9 @@ def main():
                 persist_nlm_session(nlm_session_url, connector_token)
             else:
                 print("  ⚠️  Сессия NotebookLM не подтверждена живой — не сохраняю на хостинг")
+            # Итог непрерывного зеркалирования за прогон (хук в load_notebooklm._run).
+            print(f"  ℹ️  Сессия NotebookLM зеркалировалась на хостинг "
+                  f"{load_notebooklm.session_persist_count} раз(а) за прогон")
         except Exception as e:
             print(f"  ⚠️  Проверка сессии перед сохранением не удалась ({e}) — не сохраняю")
 

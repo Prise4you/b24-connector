@@ -29,6 +29,39 @@ class NotebookLMError(Exception):
     pass
 
 
+# ─── Непрерывный persist сессии (зеркалирование storage_state на хостинг) ─────
+# Сессия NotebookLM ротирует cookie __Secure-1PSIDTS практически на каждом
+# CLI-вызове (notebooklm-py атомарно сохраняет storage_state.json на диск при
+# ротации). В CI раннер эфемерный — чтобы ротированная сессия не терялась при
+# таймауте/сбое, коннектор выставляет SESSION_PERSIST_HOOK, и _run() после
+# каждого успешного вызова, если файл сессии изменился, вызывает хук (POST на
+# хостинг). Так хостинг-копия отстаёт от диска раннера максимум на один вызов.
+SESSION_PERSIST_HOOK = None        # callable | None — ставит connector.py
+_last_persist_mtime = 0.0          # baseline, чтобы не слать неизменившийся файл
+session_persist_count = 0          # для итоговой строки в логе прогона
+
+
+def _maybe_persist_session() -> None:
+    """Если сессия на диске изменилась с прошлого раза — зеркалировать на хостинг.
+    Любой сбой persist ГЛОТАЕТСЯ: он не должен ронять загрузку в NotebookLM."""
+    global _last_persist_mtime, session_persist_count
+    if SESSION_PERSIST_HOOK is None:
+        return
+    try:
+        mtime = os.path.getmtime(DEFAULT_STORAGE)
+    except OSError:
+        return
+    if mtime <= _last_persist_mtime:
+        return
+    try:
+        SESSION_PERSIST_HOOK()
+        _last_persist_mtime = mtime
+        session_persist_count += 1
+    except Exception:
+        # Молча: сеть/хостинг могли моргнуть, следующий вызов повторит.
+        pass
+
+
 def _run(args: list, timeout: int = 180) -> str:
     """Запустить notebooklm CLI, вернуть stdout. Поднять при ошибке."""
     cmd = [NOTEBOOKLM_BIN] + args
@@ -39,6 +72,8 @@ def _run(args: list, timeout: int = 180) -> str:
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip() or "(пустой вывод CLI)"
         raise NotebookLMError(f"CLI error ({proc.returncode}): {detail[:300]}")
+    # Успешный вызов мог ротировать сессию — зеркалируем свежий storage_state.
+    _maybe_persist_session()
     return proc.stdout
 
 
