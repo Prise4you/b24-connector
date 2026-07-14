@@ -1669,14 +1669,36 @@ def main():
                     # "ok". Теперь копим её в nlm_errors → статус partial/error.
                     nlm_errors.append({"group_id": group_id, "name": nb_title,
                                        "error": str(e)})
-                    # Истёкшая сессия Google одинаково завалит все остальные
-                    # проекты — взводим флаг, дальше пропускаем NLM-загрузку.
+                    # Ошибка ПОХОЖА на истёкшую сессию — но один сбой на одном
+                    # конкретном вызове (delete-by-title и т.п.) не обязательно
+                    # означает, что сессия реально мертва: notebooklm-py заворачивает
+                    # даже разовые/нетипичные сбои в общий "UNEXPECTED_ERROR" (см.
+                    # error_handler.py — сырой ValueError из extract_csrf_from_html
+                    # падает в generic except Exception, а не в типизированный
+                    # AuthError). Раньше латчили nlm_session_dead по одному
+                    # совпадению строки — это однажды похоронило 9 из 10 проектов
+                    # при живой сессии (сессия продолжала ротироваться и после этого
+                    # сбоя — видно по mtime storage_state — но остальные проекты уже
+                    # были пропущены). Теперь ПЕРЕПРОВЕРЯЕМ реальным вызовом перед
+                    # тем, как сдаваться на весь оставшийся прогон.
                     if any(m in str(e) for m in
                            ("Authentication expired", "UNEXPECTED_ERROR",
                             "notebooklm login", "accounts.google.com")):
-                        nlm_session_dead = True
-                        print("  ⚠️  Сессия NotebookLM истекла — остальные проекты "
-                              "пропущу, нужен свежий notebooklm login")
+                        import load_notebooklm
+                        still_ok = False
+                        try:
+                            still_ok = load_notebooklm.session_status().get("ok", False)
+                        except Exception:
+                            pass
+                        if still_ok:
+                            print(f"  ℹ️  Похоже на auth-ошибку, но проверка "
+                                  f"подтвердила: сессия жива — считаю разовым сбоем "
+                                  f"проекта «{nb_title}», продолжаю с остальными")
+                        else:
+                            nlm_session_dead = True
+                            print("  ⚠️  Сессия NotebookLM истекла (подтверждено "
+                                  "проверкой) — остальные проекты пропущу, нужен "
+                                  "свежий notebooklm login")
         except Exception as e:
             gid = int(proj.get("group_id", 0))
             gname = (proj.get("notebook_name") or "").strip() or f"group {gid}"
