@@ -132,7 +132,7 @@ jobs:
       (github.event_name == 'schedule' && github.event.schedule == '0 6 1 * *') ||
       (github.event_name == 'repository_dispatch' && github.event.action == 'digest_trigger')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
 
     steps:
       - name: Checkout

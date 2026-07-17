@@ -212,13 +212,66 @@ def _persist_session_quiet(url: str, token: str) -> None:
 # Менять при изменении config-шаблона digest.question.
 DIGEST_PROMPT_VERSION = "промпт v1"
 
+# Версия формулировки разового обзорного промпта (см. OVERVIEW_QUESTION ниже).
+OVERVIEW_PROMPT_VERSION = "обзор v1"
 
-def _build_digest_markdown(nb_title: str, month_str: str, question: str, resp: dict) -> tuple:
+# Разовый промпт «расскажи максимально подробно о проекте целиком» — в отличие
+# от digest.question (который параметризуется в config.json на проект и
+# ограничен месяцем {month}), этот вопрос один и тот же для всех проектов и не
+# привязан к периоду: цель — глубокая сводка по ВСЕЙ истории проекта, а не за
+# конкретный месяц. Спрашивается на каждом прогоне --digest (Python не знает,
+# создан ли уже документ «Обзор» в AFFiNE — это решает affine_digest_push.mjs,
+# создавая его только один раз); лишний ask() в последующие месяцы — принятый
+# компромисс ради простоты (см. connector/scripts/affine_digest_push.mjs).
+OVERVIEW_QUESTION = (
+    "Составь максимально подробную сводную информацию о проекте целиком, "
+    "на основе ВСЕХ предоставленных источников за всё время.\n\n"
+    "Правила:\n"
+    "- Отвечай ТОЛЬКО по источникам. Ничего не додумывай.\n"
+    "- Если по разделу данных нет — напиши «Нет данных». Не заполняй раздел домыслами.\n"
+    "- Каждый факт — с датой и именем участника, если они есть в источнике.\n"
+    "- Указывай, из какого источника факт (задача, чат, диалог с клиентом, файл).\n\n"
+    "Выдай ровно эти разделы:\n\n"
+    "## Общая информация о проекте\n"
+    "Что за проект, для какого клиента, когда фактически стартовали работы.\n\n"
+    "## Ключевые участники\n"
+    "Кто со стороны АНИТ и со стороны клиента участвует, за что каждый отвечает.\n\n"
+    "## Технический контур\n"
+    "Что настраивали/разрабатывали технически (стек, интеграции, ключевые модули). "
+    "Если проект не технический — «Нет данных».\n\n"
+    "## Ключевые решения\n"
+    "Решения, определившие ход проекта за всё время, и почему они были приняты "
+    "(если причина не названа — «причина не указана»).\n\n"
+    "## Текущий статус\n"
+    "На чём проект находится сейчас, судя по последним по дате материалам.\n\n"
+    "## Особенности клиента и риски\n"
+    "Стиль общения клиента, важные договорённости, на что обращать внимание в дальнейшей работе."
+)
+
+# Русские названия месяцев для читаемых заголовков документов ("Июнь 2026")
+# вместо машинного "2026-06" — доки лежат внутри папки проекта/Журнал, поэтому
+# заголовку не нужно повторять название проекта (оно и так видно из пути).
+MONTHS_RU = {
+    "01": "Январь", "02": "Февраль", "03": "Март", "04": "Апрель",
+    "05": "Май", "06": "Июнь", "07": "Июль", "08": "Август",
+    "09": "Сентябрь", "10": "Октябрь", "11": "Ноябрь", "12": "Декабрь",
+}
+
+
+def _period_ru(month_str: str) -> str:
+    """"2026-06" → "Июнь 2026"."""
+    year, month = month_str.split("-")
+    return f"{MONTHS_RU.get(month, month)} {year}"
+
+
+def _build_digest_markdown(nb_title: str, period_ru: str, question: str, resp: dict) -> tuple:
     """
     Собрать markdown ежемесячного дайджеста из ответа ask_notebook().
 
     Заголовок H1 совпадает с title документа в AFFiNE (см. affine_digest_push.mjs) —
-    иначе документ называется одним, а внутри написано другое.
+    иначе документ называется одним, а внутри написано другое. Название проекта
+    в H1 не дублируется — документ лежит внутри папки проекта/Журнал в AFFiNE,
+    контекст уже даёт путь; nb_title указан рядом с версией промпта строкой ниже.
 
     Сам текст промпта в документ НЕ печатается: он многострочный и вытеснил бы
     полезное содержимое с первого экрана. Для разбора «почему модель ответила так»
@@ -237,9 +290,9 @@ def _build_digest_markdown(nb_title: str, month_str: str, question: str, resp: d
     answer, n_secrets = security.redact_doc(answer_raw, source_label=f"digest:{nb_title}:answer")
     refs = resp.get("references") or []
     lines = [
-        f"# Дайджест проекта — {nb_title} — {month_str}",
+        f"# {period_ru}",
         "",
-        f"_Автоматический дайджест ({DIGEST_PROMPT_VERSION}). Сгенерировано: {ts}_",
+        f"_Дайджест проекта «{nb_title}» ({DIGEST_PROMPT_VERSION}). Сгенерировано: {ts}_",
         "",
         answer,
     ]
@@ -249,6 +302,37 @@ def _build_digest_markdown(nb_title: str, month_str: str, question: str, resp: d
             title = r.get("source_id") or r.get("chunk_id") or "?"
             cited_raw = (r.get("cited_text") or "").strip().replace("\n", " ")
             cited, n_cited = security.redact_doc(cited_raw, source_label=f"digest:{nb_title}:cite")
+            n_secrets += n_cited
+            if len(cited) > 200:
+                cited = cited[:200] + "…"
+            lines.append(f"- [{title}] {cited}")
+    return "\n".join(lines) + "\n", n_secrets
+
+
+def _build_overview_markdown(nb_title: str, resp: dict) -> tuple:
+    """
+    Собрать markdown разового «Обзора» проекта (см. OVERVIEW_QUESTION).
+    Та же логика редакта и структуры источников, что и в _build_digest_markdown,
+    но без периода — обзор охватывает всю историю проекта.
+    Возвращает (markdown, secrets_found).
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    answer_raw = (resp.get("answer") or "").strip()
+    answer, n_secrets = security.redact_doc(answer_raw, source_label=f"overview:{nb_title}:answer")
+    refs = resp.get("references") or []
+    lines = [
+        "# Обзор",
+        "",
+        f"_Обзор проекта «{nb_title}» ({OVERVIEW_PROMPT_VERSION}). Сгенерировано: {ts}_",
+        "",
+        answer,
+    ]
+    if refs:
+        lines += ["", "## Источники", ""]
+        for r in refs:
+            title = r.get("source_id") or r.get("chunk_id") or "?"
+            cited_raw = (r.get("cited_text") or "").strip().replace("\n", " ")
+            cited, n_cited = security.redact_doc(cited_raw, source_label=f"overview:{nb_title}:cite")
             n_secrets += n_cited
             if len(cited) > 200:
                 cited = cited[:200] + "…"
@@ -1502,7 +1586,9 @@ def main():
         # первое число текущего минус день.
         _today = datetime.now(timezone.utc)
         month_str = (_today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+        period_ru = _period_ru(month_str)
         digest_results = []
+        overview_results = []
         digest_errors = []
         for proj in digest_projects:
             digest_cfg = proj.get("digest") or {}
@@ -1511,6 +1597,7 @@ def main():
             group_id = int(proj.get("group_id", 0))
             nb_id = proj.get("notebook_id", "")
             nb_title = proj.get("notebook_name") or f"group {group_id}"
+            project_type = proj.get("project_type", "client")
             question = (digest_cfg.get("question") or "").strip()
             if not nb_id or not question:
                 print(f"  ⚠️  [{nb_title}] digest.enabled=true, но нет notebook_id/question — пропуск")
@@ -1522,16 +1609,33 @@ def main():
             print(f"  → [{nb_title}] запрашиваю дайджест...")
             try:
                 resp = load_notebooklm.ask_notebook(nb_id, question)
-                md, n_secrets = _build_digest_markdown(nb_title, month_str, question, resp)
+                md, n_secrets = _build_digest_markdown(nb_title, period_ru, question, resp)
                 digest_results.append({
                     "group_id": group_id, "notebook_name": nb_title,
-                    "month": month_str, "markdown": md,
+                    "project_type": project_type, "period_ru": period_ru, "markdown": md,
                 })
                 secrets_note = f", замаскировано ПДн: {n_secrets}" if n_secrets else ""
                 print(f"  ✅ [{nb_title}] дайджест получен ({len(md)} символов{secrets_note})")
             except Exception as e:
                 print(f"  ❌ [{nb_title}] дайджест: {e}")
                 digest_errors.append({"group_id": group_id, "name": nb_title, "error": str(e)})
+                continue
+
+            # Обзор — разовая сводка на весь проект (см. OVERVIEW_QUESTION). Спрашивается
+            # каждый прогон: Python не знает, есть ли уже документ «Обзор» в AFFiNE —
+            # это решает affine_digest_push.mjs (создаёт один раз, дальше пропускает).
+            print(f"  → [{nb_title}] запрашиваю обзор...")
+            try:
+                resp_ov = load_notebooklm.ask_notebook(nb_id, OVERVIEW_QUESTION)
+                md_ov, n_secrets_ov = _build_overview_markdown(nb_title, resp_ov)
+                overview_results.append({
+                    "group_id": group_id, "notebook_name": nb_title,
+                    "project_type": project_type, "markdown": md_ov,
+                })
+                secrets_note = f", замаскировано ПДн: {n_secrets_ov}" if n_secrets_ov else ""
+                print(f"  ✅ [{nb_title}] обзор получен ({len(md_ov)} символов{secrets_note})")
+            except Exception as e:
+                print(f"  ❌ [{nb_title}] обзор: {e}")
 
         # Аудит на хостинге — отдельно и НЕ критично для успеха AFFiNE-шага.
         if args.status_url and connector_token and digest_results:
@@ -1543,9 +1647,10 @@ def main():
         out_path = Path(out_dir) / "digest_payload.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(
-            json.dumps(digest_results, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"  → digest_payload.json: {len(digest_results)} записей, "
-              f"{len(digest_errors)} ошибок ({out_path})")
+            json.dumps({"digests": digest_results, "overviews": overview_results},
+                       ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  → digest_payload.json: {len(digest_results)} дайджестов, "
+              f"{len(overview_results)} обзоров, {len(digest_errors)} ошибок ({out_path})")
 
         if nlm_session_url and connector_token:
             try:
