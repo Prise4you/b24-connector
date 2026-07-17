@@ -264,7 +264,34 @@ def _period_ru(month_str: str) -> str:
     return f"{MONTHS_RU.get(month, month)} {year}"
 
 
-def _build_digest_markdown(nb_title: str, period_ru: str, question: str, resp: dict) -> tuple:
+def _refs_to_lines(refs: list, nb_title: str, label: str, source_titles: dict) -> tuple:
+    """
+    Отрендерить список references в строки markdown-списка, заменяя
+    непрозрачный source_id (UUID источника NotebookLM, сам по себе ничего не
+    говорит человеку) на человекочитаемое название источника — то же title,
+    под которым источник загружен в NotebookLM (например «Филамент — Задачи
+    и обсуждения», «CRM — Сделки»). source_titles — {source_id: title},
+    строится вызывающей стороной через load_notebooklm._list_sources().
+    Если title для id не нашёлся (источник удалили/переименовали между
+    выгрузкой и дайджестом) — используем сам id, но не роняем прогон.
+    Возвращает (lines, n_secrets).
+    """
+    lines = []
+    n_secrets = 0
+    for r in refs:
+        sid = r.get("source_id") or r.get("chunk_id") or "?"
+        title = source_titles.get(sid, sid)
+        cited_raw = (r.get("cited_text") or "").strip().replace("\n", " ")
+        cited, n_cited = security.redact_doc(cited_raw, source_label=f"{label}:{nb_title}:cite")
+        n_secrets += n_cited
+        if len(cited) > 200:
+            cited = cited[:200] + "…"
+        lines.append(f"- **[{title}]** {cited}" if cited else f"- **[{title}]**")
+    return lines, n_secrets
+
+
+def _build_digest_markdown(nb_title: str, period_ru: str, question: str, resp: dict,
+                            source_titles: dict) -> tuple:
     """
     Собрать markdown ежемесячного дайджеста из ответа ask_notebook().
 
@@ -297,19 +324,13 @@ def _build_digest_markdown(nb_title: str, period_ru: str, question: str, resp: d
         answer,
     ]
     if refs:
-        lines += ["", "## Источники", ""]
-        for r in refs:
-            title = r.get("source_id") or r.get("chunk_id") or "?"
-            cited_raw = (r.get("cited_text") or "").strip().replace("\n", " ")
-            cited, n_cited = security.redact_doc(cited_raw, source_label=f"digest:{nb_title}:cite")
-            n_secrets += n_cited
-            if len(cited) > 200:
-                cited = cited[:200] + "…"
-            lines.append(f"- [{title}] {cited}")
+        ref_lines, n_cited_secrets = _refs_to_lines(refs, nb_title, "digest", source_titles)
+        n_secrets += n_cited_secrets
+        lines += ["", "## Источники", ""] + ref_lines
     return "\n".join(lines) + "\n", n_secrets
 
 
-def _build_overview_markdown(nb_title: str, resp: dict) -> tuple:
+def _build_overview_markdown(nb_title: str, resp: dict, source_titles: dict) -> tuple:
     """
     Собрать markdown разового «Обзора» проекта (см. OVERVIEW_QUESTION).
     Та же логика редакта и структуры источников, что и в _build_digest_markdown,
@@ -328,15 +349,9 @@ def _build_overview_markdown(nb_title: str, resp: dict) -> tuple:
         answer,
     ]
     if refs:
-        lines += ["", "## Источники", ""]
-        for r in refs:
-            title = r.get("source_id") or r.get("chunk_id") or "?"
-            cited_raw = (r.get("cited_text") or "").strip().replace("\n", " ")
-            cited, n_cited = security.redact_doc(cited_raw, source_label=f"overview:{nb_title}:cite")
-            n_secrets += n_cited
-            if len(cited) > 200:
-                cited = cited[:200] + "…"
-            lines.append(f"- [{title}] {cited}")
+        ref_lines, n_cited_secrets = _refs_to_lines(refs, nb_title, "overview", source_titles)
+        n_secrets += n_cited_secrets
+        lines += ["", "## Источники", ""] + ref_lines
     return "\n".join(lines) + "\n", n_secrets
 
 
@@ -1190,7 +1205,7 @@ def build_crm_companies_doc(companies: list) -> str:
     for co in companies:
         name = co.get("TITLE") or f"Компания #{co.get('ID')}"
         lines.append(f"## {name}")
-        meta = []
+        meta = [f"**ID:** {co.get('ID')}"]
         if co.get("INDUSTRY"):
             meta.append(f"**Отрасль:** {co['INDUSTRY']}")
         phones = _format_multifield(co.get("PHONE"))
@@ -1229,7 +1244,7 @@ def build_crm_contacts_doc(contacts: list) -> str:
         parts = [ct.get("LAST_NAME", ""), ct.get("NAME", ""), ct.get("SECOND_NAME", "")]
         full_name = " ".join(p for p in parts if p).strip() or f"Контакт #{ct.get('ID')}"
         lines.append(f"## {full_name}")
-        meta = []
+        meta = [f"**ID:** {ct.get('ID')}"]
         if ct.get("POST"):
             meta.append(f"**Должность:** {ct['POST']}")
         if ct.get("COMPANY_TITLE"):
@@ -1264,7 +1279,7 @@ def build_crm_deals_doc(deals: list) -> str:
     for d in deals:
         title = d.get("TITLE") or f"Сделка #{d.get('ID')}"
         lines.append(f"## {title}")
-        meta = []
+        meta = [f"**ID:** {d.get('ID')}"]
         if d.get("STAGE_ID"):
             meta.append(f"**Стадия:** {d['STAGE_ID']}")
         if d.get("OPPORTUNITY"):
@@ -1305,7 +1320,7 @@ def build_crm_smart_doc(items: list) -> str:
             title = it.get("title") or f"#{it.get('id', '')}"
             stage = it.get("stageId", "")
             created = fmt_date(it.get("createdTime", ""))
-            row = f"- **{title}**"
+            row = f"- **{title}** (ID {it.get('id', '')})"
             if stage:
                 row += f" | стадия: {stage}"
             if created:
@@ -1606,10 +1621,15 @@ def main():
             # «за последний месяц», а это для модели значит «последний, что видно
             # в источниках» — на неполных данных период уплывёт.
             question = question.replace("{month}", month_str)
+            # {source_id: title} — чтобы в разделе «Источники» показать читаемое
+            # название источника (например «CRM — Сделки»), а не непрозрачный UUID.
+            src_list = load_notebooklm._list_sources(nb_id) or []
+            source_titles = {s.get("id"): s.get("title", s.get("id")) for s in src_list}
+
             print(f"  → [{nb_title}] запрашиваю дайджест...")
             try:
                 resp = load_notebooklm.ask_notebook(nb_id, question)
-                md, n_secrets = _build_digest_markdown(nb_title, period_ru, question, resp)
+                md, n_secrets = _build_digest_markdown(nb_title, period_ru, question, resp, source_titles)
                 digest_results.append({
                     "group_id": group_id, "notebook_name": nb_title,
                     "project_type": project_type, "period_ru": period_ru, "markdown": md,
@@ -1627,7 +1647,7 @@ def main():
             print(f"  → [{nb_title}] запрашиваю обзор...")
             try:
                 resp_ov = load_notebooklm.ask_notebook(nb_id, OVERVIEW_QUESTION)
-                md_ov, n_secrets_ov = _build_overview_markdown(nb_title, resp_ov)
+                md_ov, n_secrets_ov = _build_overview_markdown(nb_title, resp_ov, source_titles)
                 overview_results.append({
                     "group_id": group_id, "notebook_name": nb_title,
                     "project_type": project_type, "markdown": md_ov,
