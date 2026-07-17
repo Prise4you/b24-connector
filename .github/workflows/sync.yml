@@ -21,11 +21,19 @@ on:
 # ОДИН процесс одновременно — Google инвалидирует её при параллельном
 # использовании с разных IP (защита от угона сессии, проверено на реальных
 # прогонах: matrix-джобы стабильно получали "Authentication expired").
-# Поэтому все job'ы, трогающие NotebookLM, сериализованы этой группой:
-# один прогон работает, следующий ждёт в очереди. НЕ параллелить обратно.
-concurrency:
-  group: nlm-session
-  cancel-in-progress: false
+# Поэтому sync/full_inventory/digest сериализованы группой nlm-session
+# (задана на уровне КАЖДОГО из этих job'ов ниже, не здесь).
+#
+# ВАЖНО: concurrency НЕ задаётся здесь, на уровне workflow — если задать
+# её и на workflow, и на job, GitHub требует свободными ОБЕ группы разом
+# (сам workflow-level запуск ставится в очередь до того, как дело доходит
+# до job-level групп). На практике это проявилось так: ask_trigger повис
+# в статусе pending на весь час-полтора часового sync, хотя ask использует
+# СВОЮ отдельную группу nlm-session-ask — потому что unnamed workflow-level
+# group здесь раньше существовала и блокировала запуск самого run'а любого
+# job'а этого workflow, независимо от его собственной группы. Держать
+# concurrency только на job-level — единственный способ дать ask реально
+# не ждать sync.
 
 jobs:
   # Один последовательный процесс на все проекты + CRM. Параллельная
@@ -43,6 +51,9 @@ jobs:
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    concurrency:
+      group: nlm-session
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -81,12 +92,15 @@ jobs:
 
   # Полная инвентаризация NotebookLM-аккаунта — ТОЛЬКО по ручному запросу
   # из админки (кнопка «Сканировать аккаунт»), не участвует в плановом/webhook
-  # синке. Та же concurrency-группа (workflow-level) гарантирует, что
-  # инвентаризация не пересечётся с синком по сессии NotebookLM.
+  # синке. Та же concurrency-группа (job-level, см. sync выше) гарантирует,
+  # что инвентаризация не пересечётся с синком по сессии NotebookLM.
   full_inventory:
     if: github.event_name == 'repository_dispatch' && github.event.action == 'full_inventory_trigger'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: nlm-session
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -125,14 +139,17 @@ jobs:
   # NotebookLM и пишет connector/out/digest_payload.json; отдельный
   # Node-скрипт читает этот файл и пушит markdown в AFFiNE через
   # affine-mcp-server (HTTP-транспорт) — connector.py ничего не знает про
-  # AFFiNE/Node. Та же concurrency-группа (workflow-level) — не пересекается
-  # по сессии NotebookLM с sync/full_inventory.
+  # AFFiNE/Node. Та же concurrency-группа (job-level, см. sync выше) — не
+  # пересекается по сессии NotebookLM с sync/full_inventory.
   digest:
     if: >-
       (github.event_name == 'schedule' && github.event.schedule == '0 6 1 * *') ||
       (github.event_name == 'repository_dispatch' && github.event.action == 'digest_trigger')
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    concurrency:
+      group: nlm-session
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -192,8 +209,8 @@ jobs:
   # Интерактивный ask-запрос из вкладки проекта в Б24 (SONET_GROUP_DETAIL_TAB) —
   # ровно один вопрос за раз, request_id/group_id/command_id приходят из
   # client_payload (admin/api/ask.php). Своя concurrency-группа (job-level,
-  # переопределяет workflow-level nlm-session выше) — использует ВТОРОЙ
-  # независимый логин NotebookLM (тот же Google-аккаунт, отдельная cookie-
+  # не пересекается с nlm-session у sync/full_inventory/digest) — использует
+  # ВТОРОЙ независимый логин NotebookLM (тот же Google-аккаунт, отдельная cookie-
   # цепочка), поэтому не встаёт в очередь за часовым sync/digest (тот занят
   # большую часть времени — 50-90 мин на прогон, ждать столько для быстрого
   # интерактивного вопроса неприемлемо). Раннер эфемерный и изолированный
