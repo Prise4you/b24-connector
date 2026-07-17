@@ -213,7 +213,7 @@ def _persist_session_quiet(url: str, token: str) -> None:
 DIGEST_PROMPT_VERSION = "промпт v1"
 
 
-def _build_digest_markdown(nb_title: str, month_str: str, question: str, resp: dict) -> str:
+def _build_digest_markdown(nb_title: str, month_str: str, question: str, resp: dict) -> tuple:
     """
     Собрать markdown ежемесячного дайджеста из ответа ask_notebook().
 
@@ -223,9 +223,18 @@ def _build_digest_markdown(nb_title: str, month_str: str, question: str, resp: d
     Сам текст промпта в документ НЕ печатается: он многострочный и вытеснил бы
     полезное содержимое с первого экрана. Для разбора «почему модель ответила так»
     промпт есть в аудит-копии на хостинге (admin/api/digest.php).
+
+    Ответ модели и цитаты-референсы — НОВЫЙ текст, сгенерированный уже ПОСЛЕ
+    заливки источников в NotebookLM, поэтому обычный редакт при выгрузке
+    (_redact_and_save, до создания источников) его не касается. Часть источников
+    (PDF/изображения с диска) сознательно грузится без фильтра — если модель
+    процитирует оттуда телефон/почту, это не должно долететь до AFFiNE как есть.
+    Прогоняем через тот же security.redact_doc, что и обычные документы синка.
+    Возвращает (markdown, secrets_found).
     """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    answer = (resp.get("answer") or "").strip()
+    answer_raw = (resp.get("answer") or "").strip()
+    answer, n_secrets = security.redact_doc(answer_raw, source_label=f"digest:{nb_title}:answer")
     refs = resp.get("references") or []
     lines = [
         f"# Дайджест проекта — {nb_title} — {month_str}",
@@ -238,11 +247,13 @@ def _build_digest_markdown(nb_title: str, month_str: str, question: str, resp: d
         lines += ["", "## Источники", ""]
         for r in refs:
             title = r.get("source_id") or r.get("chunk_id") or "?"
-            cited = (r.get("cited_text") or "").strip().replace("\n", " ")
+            cited_raw = (r.get("cited_text") or "").strip().replace("\n", " ")
+            cited, n_cited = security.redact_doc(cited_raw, source_label=f"digest:{nb_title}:cite")
+            n_secrets += n_cited
             if len(cited) > 200:
                 cited = cited[:200] + "…"
             lines.append(f"- [{title}] {cited}")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", n_secrets
 
 
 def _post_digest(url: str, token: str, payload: dict) -> None:
@@ -1511,12 +1522,13 @@ def main():
             print(f"  → [{nb_title}] запрашиваю дайджест...")
             try:
                 resp = load_notebooklm.ask_notebook(nb_id, question)
-                md = _build_digest_markdown(nb_title, month_str, question, resp)
+                md, n_secrets = _build_digest_markdown(nb_title, month_str, question, resp)
                 digest_results.append({
                     "group_id": group_id, "notebook_name": nb_title,
                     "month": month_str, "markdown": md,
                 })
-                print(f"  ✅ [{nb_title}] дайджест получен ({len(md)} символов)")
+                secrets_note = f", замаскировано ПДн: {n_secrets}" if n_secrets else ""
+                print(f"  ✅ [{nb_title}] дайджест получен ({len(md)} символов{secrets_note})")
             except Exception as e:
                 print(f"  ❌ [{nb_title}] дайджест: {e}")
                 digest_errors.append({"group_id": group_id, "name": nb_title, "error": str(e)})
