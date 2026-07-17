@@ -389,7 +389,11 @@ def _build_ask_markdown(nb_title: str, command_label: str, resp: dict,
 
 
 def _post_digest(url: str, token: str, payload: dict) -> None:
-    """Отправить сгенерированный дайджест на хостинг (аудит, не критичный путь)."""
+    """Отправить сгенерированный дайджест/ask-результат на хостинг (не критичный путь).
+
+    Общий хелпер для digest.php и ask.php — оба принимают такой же
+    POST-паттерн (X-Connector-Token + JSON body).
+    """
     body = json.dumps(payload, ensure_ascii=False).encode()
     req = urllib.request.Request(
         url,
@@ -401,7 +405,7 @@ def _post_digest(url: str, token: str, payload: dict) -> None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp.read()
     except Exception as e:
-        print(f"  ⚠️  Не удалось сохранить дайджест на хостинге: {e}")
+        print(f"  ⚠️  Не удалось сохранить результат на хостинге ({url}): {e}")
 
 
 def save_config(cfg: dict, args, connector_token: str) -> None:
@@ -1729,8 +1733,8 @@ def main():
         print(f"→ Интерактивный ask-запрос {args.ask_request_id}...")
         import load_notebooklm
         result_url = (args.status_url or "").replace("status.php", "ask.php")
-        payload: dict = {"request_id": args.ask_request_id, "group_id": args.ask_group_id,
-                          "command_id": args.ask_command_id}
+        payload: dict = {"action": "result", "request_id": args.ask_request_id,
+                          "group_id": args.ask_group_id, "command_id": args.ask_command_id}
         try:
             proj = next((p for p in projects if int(p.get("group_id", 0)) == args.ask_group_id), None)
             if not proj or not proj.get("ask_enabled"):
