@@ -355,6 +355,39 @@ def _build_overview_markdown(nb_title: str, resp: dict, source_titles: dict) -> 
     return "\n".join(lines) + "\n", n_secrets
 
 
+def _build_ask_markdown(nb_title: str, command_label: str, resp: dict,
+                         source_titles: dict) -> tuple:
+    """
+    Собрать markdown ответа на интерактивную команду (см. ask.commands в конфиге).
+
+    В отличие от дайджеста/обзора — НЕ пишется в AFFiNE (осознанное решение:
+    разовые ad-hoc вопросы не должны засорять базу знаний массой одноразовых
+    документов, дайджест уже закрывает роль "durable запись в KB"). Аудит —
+    только data/asks/{request_id}.json на хостинге + показ в виджете проекта.
+
+    Та же логика редакта и структуры источников, что и в _build_digest_markdown:
+    ответ модели — новый текст, сгенерированный ПОСЛЕ заливки источников, обычный
+    редакт при выгрузке его не касается — обязателен отдельный проход здесь.
+    Возвращает (markdown, secrets_found).
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    answer_raw = (resp.get("answer") or "").strip()
+    answer, n_secrets = security.redact_doc(answer_raw, source_label=f"ask:{nb_title}:answer")
+    refs = resp.get("references") or []
+    lines = [
+        f"# {command_label}",
+        "",
+        f"_{nb_title}. Сгенерировано: {ts}_",
+        "",
+        answer,
+    ]
+    if refs:
+        ref_lines, n_cited_secrets = _refs_to_lines(refs, nb_title, "ask", source_titles)
+        n_secrets += n_cited_secrets
+        lines += ["", "## Источники", ""] + ref_lines
+    return "\n".join(lines) + "\n", n_secrets
+
+
 def _post_digest(url: str, token: str, payload: dict) -> None:
     """Отправить сгенерированный дайджест на хостинг (аудит, не критичный путь)."""
     body = json.dumps(payload, ensure_ascii=False).encode()
@@ -1518,6 +1551,14 @@ def main():
                          help="Ежемесячный дайджест проектов с digest.enabled=true — "
                               "фиксированный вопрос в NotebookLM, markdown на хостинг "
                               "+ JSON-выгрузка для отдельного AFFiNE-шага. Свой job.")
+    parser.add_argument("--ask", action="store_true",
+                         help="Один интерактивный ask-запрос из вкладки проекта в Б24 "
+                              "(--ask-request-id/--ask-group-id/--ask-command-id обязательны). "
+                              "Свой job, своя (изолированная) сессия NotebookLM — не пересекается "
+                              "по concurrency с sync/full_inventory/digest.")
+    parser.add_argument("--ask-request-id", default="", help="ID интерактивного запроса (для ask.php)")
+    parser.add_argument("--ask-group-id", type=int, default=0, help="group_id проекта для ask-запроса")
+    parser.add_argument("--ask-command-id", default="", help="id команды из ask.commands в конфиге")
     args = parser.parse_args()
 
     connector_token = args.connector_token or os.environ.get("CONNECTOR_TOKEN", "")
@@ -1671,6 +1712,59 @@ def main():
                        ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"  → digest_payload.json: {len(digest_results)} дайджестов, "
               f"{len(overview_results)} обзоров, {len(digest_errors)} ошибок ({out_path})")
+
+        if nlm_session_url and connector_token:
+            try:
+                if load_notebooklm.session_status().get("ok"):
+                    persist_nlm_session(nlm_session_url, connector_token)
+            except Exception as e:
+                print(f"  ⚠️  Проверка сессии перед сохранением не удалась ({e})")
+        return
+
+    # ── Интерактивный ask-запрос: ОДИН конкретный клик из вкладки проекта в Б24 ──
+    # В отличие от --digest (проходит все digest.enabled=true проекты), это всегда
+    # ровно один запрос — request_id/group_id/command_id пришли из репозиторного
+    # dispatch'а, инициированного виджетом. Не трогает Bitrix24 вообще.
+    if args.ask:
+        print(f"→ Интерактивный ask-запрос {args.ask_request_id}...")
+        import load_notebooklm
+        result_url = (args.status_url or "").replace("status.php", "ask.php")
+        payload: dict = {"request_id": args.ask_request_id, "group_id": args.ask_group_id,
+                          "command_id": args.ask_command_id}
+        try:
+            proj = next((p for p in projects if int(p.get("group_id", 0)) == args.ask_group_id), None)
+            if not proj or not proj.get("ask_enabled"):
+                raise ValueError(f"проект group_id={args.ask_group_id} не подключён к интерактивным командам")
+            nb_id = proj.get("notebook_id", "")
+            nb_title = proj.get("notebook_name") or f"group {args.ask_group_id}"
+            if not nb_id:
+                raise ValueError(f"[{nb_title}] нет notebook_id")
+
+            commands = (cfg.get("ask") or {}).get("commands") or []
+            cmd = next((c for c in commands if c.get("id") == args.ask_command_id), None)
+            if not cmd:
+                raise ValueError(f"команда '{args.ask_command_id}' не найдена в конфиге ask.commands")
+            question = (cmd.get("question") or "").strip()
+            if not question:
+                raise ValueError(f"у команды '{args.ask_command_id}' пустой question")
+
+            print(f"  → [{nb_title}] запрашиваю «{cmd.get('label', args.ask_command_id)}»...")
+            src_list = load_notebooklm._list_sources(nb_id) or []
+            source_titles = {s.get("id"): s.get("title", s.get("id")) for s in src_list}
+            resp = load_notebooklm.ask_notebook(nb_id, question)
+            md, n_secrets = _build_ask_markdown(nb_title, cmd.get("label", args.ask_command_id),
+                                                 resp, source_titles)
+
+            payload.update({"status": "done", "markdown": md, "redacted": n_secrets})
+            print(f"  ✅ [{nb_title}] ответ получен ({len(md)} символов, замаскировано ПДн: {n_secrets})")
+        except Exception as e:
+            print(f"  ❌ ask-запрос {args.ask_request_id}: {e}")
+            payload.update({"status": "error", "error": str(e)})
+
+        if result_url and connector_token:
+            _post_digest(result_url, connector_token, payload)
+        else:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
 
         if nlm_session_url and connector_token:
             try:

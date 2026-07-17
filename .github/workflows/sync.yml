@@ -5,7 +5,7 @@ on:
   # NotebookLM-аккаунта из админки (кнопка «Сканировать аккаунт») + ручной
   # тест ежемесячного дайджеста (см. job digest)
   repository_dispatch:
-    types: [sync_trigger, full_inventory_trigger, digest_trigger]
+    types: [sync_trigger, full_inventory_trigger, digest_trigger, ask_trigger]
 
   # Резервное расписание: часовой синк + ежемесячный дайджест проектов
   # (1 число месяца, 06:00 UTC — job digest ниже матчит именно эту вторую
@@ -188,3 +188,62 @@ jobs:
           AFFINE_WORKSPACE_ID: 87ff733f-41dd-4559-95ed-15989bcc772b
           AFFINE_API_TOKEN: ${{ secrets.AFFINE_API_TOKEN }}
         run: node scripts/affine_digest_push.mjs
+
+  # Интерактивный ask-запрос из вкладки проекта в Б24 (SONET_GROUP_DETAIL_TAB) —
+  # ровно один вопрос за раз, request_id/group_id/command_id приходят из
+  # client_payload (admin/api/ask.php). Своя concurrency-группа (job-level,
+  # переопределяет workflow-level nlm-session выше) — использует ВТОРОЙ
+  # независимый логин NotebookLM (тот же Google-аккаунт, отдельная cookie-
+  # цепочка), поэтому не встаёт в очередь за часовым sync/digest (тот занят
+  # большую часть времени — 50-90 мин на прогон, ждать столько для быстрого
+  # интерактивного вопроса неприемлемо). Раннер эфемерный и изолированный
+  # от раннера job'а sync, поэтому локальный путь профиля CLI может
+  # оставаться тем же (~/.notebooklm/profiles/default) — коллизия сессий
+  # возникает на стороне Google при ПАРАЛЛЕЛЬНОМ использовании одной и той
+  # же cookie-цепочки, а не от одинакового локального пути на разных
+  # раннерах; здесь цепочка изначально другая (отдельный секрет-сид).
+  ask:
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'ask_trigger'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: nlm-session-ask
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      # Seed из ВТОРОГО секрета (второй независимый логин) — не пересекается
+      # с NLM_STORAGE_STATE, используемым sync/full_inventory/digest.
+      - name: Restore NotebookLM session (seed, isolated ask profile)
+        run: |
+          mkdir -p ~/.notebooklm/profiles/default
+          echo "${{ secrets.NLM_STORAGE_STATE_ASK }}" | base64 -d \
+            > ~/.notebooklm/profiles/default/storage_state.json
+
+      - name: Run ask
+        env:
+          NLM_BIN: notebooklm
+          CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
+        run: |
+          python connector.py \
+            --config-url https://anitconf.ru/ntlm/api/config.php \
+            --status-url https://anitconf.ru/ntlm/api/status.php \
+            --nlm-session-url https://anitconf.ru/ntlm/api/nlm_session_ask.php \
+            --connector-token "$CONNECTOR_TOKEN" \
+            --ask \
+            --ask-request-id "${{ github.event.client_payload.request_id }}" \
+            --ask-group-id "${{ github.event.client_payload.group_id }}" \
+            --ask-command-id "${{ github.event.client_payload.command_id }}"
