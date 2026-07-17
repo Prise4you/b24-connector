@@ -1,0 +1,9 @@
+{
+  "name": "b24-notebooklm-affine-digest-push",
+  "private": true,
+  "type": "module",
+  "description": "Пушит ежемесячные дайджесты проектов (out/digest_payload.json) в AFFiNE через affine-mcp-server (HTTP-транспорт).",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.2"
+  }
+}

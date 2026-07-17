@@ -213,6 +213,19 @@ def _count_sources(notebook_id: str) -> Optional[int]:
     return None if srcs is None else len(srcs)
 
 
+def ask_notebook(notebook_id: str, question: str, timeout: int = 120) -> dict:
+    """
+    Задать ноутбуку вопрос через `notebooklm ask ... --json` и вернуть разобранный
+    ответ: {"answer": str, "conversation_id": str, "references": [...]}.
+    В отличие от _list_sources — НЕ проглатывает ошибку в None: вызывающая
+    сторона (режим --digest в connector.py) сама решает, что делать со сбоем
+    по одному проекту, и должна отличать «не удалось спросить» от «спросили,
+    источников нет».
+    """
+    out = _run(["ask", question, "-n", notebook_id, "--json"], timeout=timeout)
+    return json.loads(out)
+
+
 def dedupe_sources(notebook_id: str, expected_titles: set, group_prefix: str,
                     dry_run: bool = True) -> dict:
     """

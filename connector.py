@@ -23,7 +23,7 @@ import sys
 import time
 import argparse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -205,6 +205,60 @@ def _persist_session_quiet(url: str, token: str) -> None:
     import base64, load_notebooklm
     raw = Path(load_notebooklm.DEFAULT_STORAGE).read_bytes()
     push_remote_nlm_session(url, token, base64.b64encode(raw).decode())
+
+
+# Версия формулировки промпта дайджеста. Печатается в документ вместо самого промпта:
+# по ней видно, каким вопросом получен ответ, без простыни на первом экране.
+# Менять при изменении config-шаблона digest.question.
+DIGEST_PROMPT_VERSION = "промпт v1"
+
+
+def _build_digest_markdown(nb_title: str, month_str: str, question: str, resp: dict) -> str:
+    """
+    Собрать markdown ежемесячного дайджеста из ответа ask_notebook().
+
+    Заголовок H1 совпадает с title документа в AFFiNE (см. affine_digest_push.mjs) —
+    иначе документ называется одним, а внутри написано другое.
+
+    Сам текст промпта в документ НЕ печатается: он многострочный и вытеснил бы
+    полезное содержимое с первого экрана. Для разбора «почему модель ответила так»
+    промпт есть в аудит-копии на хостинге (admin/api/digest.php).
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    answer = (resp.get("answer") or "").strip()
+    refs = resp.get("references") or []
+    lines = [
+        f"# Дайджест проекта — {nb_title} — {month_str}",
+        "",
+        f"_Автоматический дайджест ({DIGEST_PROMPT_VERSION}). Сгенерировано: {ts}_",
+        "",
+        answer,
+    ]
+    if refs:
+        lines += ["", "## Источники", ""]
+        for r in refs:
+            title = r.get("source_id") or r.get("chunk_id") or "?"
+            cited = (r.get("cited_text") or "").strip().replace("\n", " ")
+            if len(cited) > 200:
+                cited = cited[:200] + "…"
+            lines.append(f"- [{title}] {cited}")
+    return "\n".join(lines) + "\n"
+
+
+def _post_digest(url: str, token: str, payload: dict) -> None:
+    """Отправить сгенерированный дайджест на хостинг (аудит, не критичный путь)."""
+    body = json.dumps(payload, ensure_ascii=False).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "X-Connector-Token": token},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:
+        print(f"  ⚠️  Не удалось сохранить дайджест на хостинге: {e}")
 
 
 def save_config(cfg: dict, args, connector_token: str) -> None:
@@ -1350,6 +1404,10 @@ def main():
     parser.add_argument("--full-inventory", action="store_true",
                          help="Полная инвентаризация аккаунта NotebookLM (list_notebooks) — "
                               "ТОЛЬКО по ручному запросу из админки, не для расписания/webhook")
+    parser.add_argument("--digest", action="store_true",
+                         help="Ежемесячный дайджест проектов с digest.enabled=true — "
+                              "фиксированный вопрос в NotebookLM, markdown на хостинг "
+                              "+ JSON-выгрузка для отдельного AFFiNE-шага. Свой job.")
     args = parser.parse_args()
 
     connector_token = args.connector_token or os.environ.get("CONNECTOR_TOKEN", "")
@@ -1419,6 +1477,71 @@ def main():
     if not projects:
         old_nb = cfg.get("targets", {}).get("notebooklm", {}).get("notebook_id", "")
         projects = [{"group_id": int(cfg["group_id"]), "notebook_id": old_nb}]
+
+    # ── Ежемесячный дайджест: не трогает Bitrix24 вообще, только NotebookLM ──
+    if args.digest:
+        print("→ Ежемесячный дайджест проектов...")
+        digest_projects = projects
+        if args.group:
+            digest_projects = [p for p in projects if int(p.get("group_id", 0)) == args.group]
+
+        import load_notebooklm
+        # Дайджест подводит итог ЗАВЕРШИВШЕГОСЯ месяца, а крон стоит на 1 число:
+        # datetime.now() в этот момент даёт уже новый месяц. Берём предыдущий —
+        # первое число текущего минус день.
+        _today = datetime.now(timezone.utc)
+        month_str = (_today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+        digest_results = []
+        digest_errors = []
+        for proj in digest_projects:
+            digest_cfg = proj.get("digest") or {}
+            if not digest_cfg.get("enabled"):
+                continue
+            group_id = int(proj.get("group_id", 0))
+            nb_id = proj.get("notebook_id", "")
+            nb_title = proj.get("notebook_name") or f"group {group_id}"
+            question = (digest_cfg.get("question") or "").strip()
+            if not nb_id or not question:
+                print(f"  ⚠️  [{nb_title}] digest.enabled=true, но нет notebook_id/question — пропуск")
+                continue
+            # {month} в шаблоне → конкретный месяц. Без подстановки пришлось бы писать
+            # «за последний месяц», а это для модели значит «последний, что видно
+            # в источниках» — на неполных данных период уплывёт.
+            question = question.replace("{month}", month_str)
+            print(f"  → [{nb_title}] запрашиваю дайджест...")
+            try:
+                resp = load_notebooklm.ask_notebook(nb_id, question)
+                md = _build_digest_markdown(nb_title, month_str, question, resp)
+                digest_results.append({
+                    "group_id": group_id, "notebook_name": nb_title,
+                    "month": month_str, "markdown": md,
+                })
+                print(f"  ✅ [{nb_title}] дайджест получен ({len(md)} символов)")
+            except Exception as e:
+                print(f"  ❌ [{nb_title}] дайджест: {e}")
+                digest_errors.append({"group_id": group_id, "name": nb_title, "error": str(e)})
+
+        # Аудит на хостинге — отдельно и НЕ критично для успеха AFFiNE-шага.
+        if args.status_url and connector_token and digest_results:
+            digest_url = args.status_url.replace("status.php", "digest.php")
+            for d in digest_results:
+                _post_digest(digest_url, connector_token, d)
+
+        # Отдать результат следующему шагу job'а (AFFiNE-пуш, отдельный процесс).
+        out_path = Path(out_dir) / "digest_payload.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(digest_results, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  → digest_payload.json: {len(digest_results)} записей, "
+              f"{len(digest_errors)} ошибок ({out_path})")
+
+        if nlm_session_url and connector_token:
+            try:
+                if load_notebooklm.session_status().get("ok"):
+                    persist_nlm_session(nlm_session_url, connector_token)
+            except Exception as e:
+                print(f"  ⚠️  Проверка сессии перед сохранением не удалась ({e})")
+        return
 
     # ── Валидация ─────────────────────────────────────────────────────────────
     cfg_warnings = security.validate_config({**cfg, "webhook_url": webhook})

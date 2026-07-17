@@ -2,15 +2,19 @@ name: B24 → NotebookLM Sync
 
 on:
   # Вызов из webhook.php при событии в Б24 + ручная полная инвентаризация
-  # NotebookLM-аккаунта из админки (кнопка «Сканировать аккаунт»)
+  # NotebookLM-аккаунта из админки (кнопка «Сканировать аккаунт») + ручной
+  # тест ежемесячного дайджеста (см. job digest)
   repository_dispatch:
-    types: [sync_trigger, full_inventory_trigger]
+    types: [sync_trigger, full_inventory_trigger, digest_trigger]
 
-  # Резервное расписание: раз в час (если webhook пропустил событие)
+  # Резервное расписание: часовой синк + ежемесячный дайджест проектов
+  # (1 число месяца, 06:00 UTC — job digest ниже матчит именно эту вторую
+  # строку по точному значению github.event.schedule, sync — первую)
   schedule:
     - cron: '0 * * * *'
+    - cron: '0 6 1 * *'
 
-  # Ручной запуск через интерфейс GitHub
+  # Ручной запуск через интерфейс GitHub (только job sync — см. его if:)
   workflow_dispatch:
 
 # КРИТИЧНО: сессию NotebookLM (NLM_STORAGE_STATE) может использовать только
@@ -33,7 +37,10 @@ jobs:
   # только в самом конце main(), после всех проектов; не дойдя до конца,
   # ротированная сессия никогда не сохранится на хостинг).
   sync:
-    if: github.event_name != 'repository_dispatch' || github.event.action != 'full_inventory_trigger'
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 * * * *') ||
+      (github.event_name == 'repository_dispatch' && github.event.action == 'sync_trigger') ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -112,3 +119,72 @@ jobs:
             --nlm-session-url https://anitconf.ru/ntlm/api/nlm_session.php \
             --connector-token "$CONNECTOR_TOKEN" \
             --full-inventory
+
+  # Ежемесячный дайджест проектов (digest.enabled=true в config.json) →
+  # AFFiNE. Два независимых шага: connector.py --digest спрашивает
+  # NotebookLM и пишет connector/out/digest_payload.json; отдельный
+  # Node-скрипт читает этот файл и пушит markdown в AFFiNE через
+  # affine-mcp-server (HTTP-транспорт) — connector.py ничего не знает про
+  # AFFiNE/Node. Та же concurrency-группа (workflow-level) — не пересекается
+  # по сессии NotebookLM с sync/full_inventory.
+  digest:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 6 1 * *') ||
+      (github.event_name == 'repository_dispatch' && github.event.action == 'digest_trigger')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      # Версия зафиксирована сознательно: affine-mcp-server — неофициальный
+      # пакет поверх недокументированного протокола AFFiNE, бампать только
+      # после явного повторного теста.
+      - name: Install affine-mcp-server (pinned)
+        run: npm install -g affine-mcp-server@2.5.0
+
+      - name: Install Node deps for push script
+        working-directory: scripts
+        run: npm install
+
+      - name: Restore NotebookLM session (seed)
+        run: |
+          mkdir -p ~/.notebooklm/profiles/default
+          echo "${{ secrets.NLM_STORAGE_STATE }}" | base64 -d \
+            > ~/.notebooklm/profiles/default/storage_state.json
+
+      - name: Run digest (Bitrix24/NotebookLM side)
+        env:
+          NLM_BIN: notebooklm
+          CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
+        run: |
+          python connector.py \
+            --config-url https://anitconf.ru/ntlm/api/config.php \
+            --status-url https://anitconf.ru/ntlm/api/status.php \
+            --nlm-session-url https://anitconf.ru/ntlm/api/nlm_session.php \
+            --connector-token "$CONNECTOR_TOKEN" \
+            --digest
+
+      - name: Push digest(s) to AFFiNE
+        env:
+          AFFINE_BASE_URL: https://know.anitconf.ru
+          AFFINE_WORKSPACE_ID: 87ff733f-41dd-4559-95ed-15989bcc772b
+          AFFINE_API_TOKEN: ${{ secrets.AFFINE_API_TOKEN }}
+        run: node scripts/affine_digest_push.mjs
