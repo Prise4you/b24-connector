@@ -264,34 +264,24 @@ def _period_ru(month_str: str) -> str:
     return f"{MONTHS_RU.get(month, month)} {year}"
 
 
-def _refs_to_lines(refs: list, nb_title: str, label: str, source_titles: dict) -> tuple:
+def _strip_citation_markers(text: str) -> str:
     """
-    Отрендерить список references в строки markdown-списка, заменяя
-    непрозрачный source_id (UUID источника NotebookLM, сам по себе ничего не
-    говорит человеку) на человекочитаемое название источника — то же title,
-    под которым источник загружен в NotebookLM (например «Филамент — Задачи
-    и обсуждения», «CRM — Сделки»). source_titles — {source_id: title},
-    строится вызывающей стороной через load_notebooklm._list_sources().
-    Если title для id не нашёлся (источник удалили/переименовали между
-    выгрузкой и дайджестом) — используем сам id, но не роняем прогон.
-    Возвращает (lines, n_secrets).
+    NotebookLM иногда вставляет в текст ответа голые футнот-ссылки вида
+    «[4, 11, 12]» — без сопоставления с реальным источником это нечитаемый
+    шум, а не текст (source_id из references не всегда совпадает с id из
+    _list_sources, надёжно смэппить на название источника нельзя — проще и
+    честнее убрать). Вырезаем строго числовые группы в скобках, не трогая
+    содержательные вставки вида «[tasks.md, 260]», и подчищаем осиротевшие
+    пустые буллеты/пунктуацию, которые остаются после вырезания.
     """
-    lines = []
-    n_secrets = 0
-    for r in refs:
-        sid = r.get("source_id") or r.get("chunk_id") or "?"
-        title = source_titles.get(sid, sid)
-        cited_raw = (r.get("cited_text") or "").strip().replace("\n", " ")
-        cited, n_cited = security.redact_doc(cited_raw, source_label=f"{label}:{nb_title}:cite")
-        n_secrets += n_cited
-        if len(cited) > 200:
-            cited = cited[:200] + "…"
-        lines.append(f"- **[{title}]** {cited}" if cited else f"- **[{title}]**")
-    return lines, n_secrets
+    text = re.sub(r'\[\s*\d+(?:\s*,\s*\d+)*\s*\]', '', text)
+    text = re.sub(r'(?m)^[ \t]*[*\-][ \t]*[.,!?;:]*[ \t]*$\n?', '', text)
+    text = re.sub(r'[ \t]+([.,!?;:])', r'\1', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    return text
 
 
-def _build_digest_markdown(nb_title: str, period_ru: str, question: str, resp: dict,
-                            source_titles: dict) -> tuple:
+def _build_digest_markdown(nb_title: str, period_ru: str, question: str, resp: dict) -> tuple:
     """
     Собрать markdown ежемесячного дайджеста из ответа ask_notebook().
 
@@ -304,18 +294,19 @@ def _build_digest_markdown(nb_title: str, period_ru: str, question: str, resp: d
     полезное содержимое с первого экрана. Для разбора «почему модель ответила так»
     промпт есть в аудит-копии на хостинге (admin/api/digest.php).
 
-    Ответ модели и цитаты-референсы — НОВЫЙ текст, сгенерированный уже ПОСЛЕ
-    заливки источников в NotebookLM, поэтому обычный редакт при выгрузке
-    (_redact_and_save, до создания источников) его не касается. Часть источников
-    (PDF/изображения с диска) сознательно грузится без фильтра — если модель
-    процитирует оттуда телефон/почту, это не должно долететь до AFFiNE как есть.
-    Прогоняем через тот же security.redact_doc, что и обычные документы синка.
+    Ответ модели — НОВЫЙ текст, сгенерированный уже ПОСЛЕ заливки источников в
+    NotebookLM, поэтому обычный редакт при выгрузке (_redact_and_save, до
+    создания источников) его не касается. Прогоняем через тот же
+    security.redact_doc, что и обычные документы синка. Список references из
+    ask_notebook() намеренно не выводится отдельным блоком — сырые цитаты с
+    UUID источников нечитаемы и рушат текст (см. фидбек пользователя); вместо
+    этого зачищаем голые числовые футнот-маркеры прямо из текста ответа.
     Возвращает (markdown, secrets_found).
     """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     answer_raw = (resp.get("answer") or "").strip()
     answer, n_secrets = security.redact_doc(answer_raw, source_label=f"digest:{nb_title}:answer")
-    refs = resp.get("references") or []
+    answer = _strip_citation_markers(answer)
     lines = [
         f"# {period_ru}",
         "",
@@ -323,24 +314,20 @@ def _build_digest_markdown(nb_title: str, period_ru: str, question: str, resp: d
         "",
         answer,
     ]
-    if refs:
-        ref_lines, n_cited_secrets = _refs_to_lines(refs, nb_title, "digest", source_titles)
-        n_secrets += n_cited_secrets
-        lines += ["", "## Источники", ""] + ref_lines
     return "\n".join(lines) + "\n", n_secrets
 
 
-def _build_overview_markdown(nb_title: str, resp: dict, source_titles: dict) -> tuple:
+def _build_overview_markdown(nb_title: str, resp: dict) -> tuple:
     """
     Собрать markdown разового «Обзора» проекта (см. OVERVIEW_QUESTION).
-    Та же логика редакта и структуры источников, что и в _build_digest_markdown,
+    Та же логика редакта и зачистки цитат, что и в _build_digest_markdown,
     но без периода — обзор охватывает всю историю проекта.
     Возвращает (markdown, secrets_found).
     """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     answer_raw = (resp.get("answer") or "").strip()
     answer, n_secrets = security.redact_doc(answer_raw, source_label=f"overview:{nb_title}:answer")
-    refs = resp.get("references") or []
+    answer = _strip_citation_markers(answer)
     lines = [
         "# Обзор",
         "",
@@ -348,15 +335,10 @@ def _build_overview_markdown(nb_title: str, resp: dict, source_titles: dict) -> 
         "",
         answer,
     ]
-    if refs:
-        ref_lines, n_cited_secrets = _refs_to_lines(refs, nb_title, "overview", source_titles)
-        n_secrets += n_cited_secrets
-        lines += ["", "## Источники", ""] + ref_lines
     return "\n".join(lines) + "\n", n_secrets
 
 
-def _build_ask_markdown(nb_title: str, command_label: str, resp: dict,
-                         source_titles: dict) -> tuple:
+def _build_ask_markdown(nb_title: str, command_label: str, resp: dict) -> tuple:
     """
     Собрать markdown ответа на интерактивную команду (см. ask.commands в конфиге).
 
@@ -365,7 +347,7 @@ def _build_ask_markdown(nb_title: str, command_label: str, resp: dict,
     документов, дайджест уже закрывает роль "durable запись в KB"). Аудит —
     только data/asks/{request_id}.json на хостинге + показ в виджете проекта.
 
-    Та же логика редакта и структуры источников, что и в _build_digest_markdown:
+    Та же логика редакта и зачистки цитат, что и в _build_digest_markdown:
     ответ модели — новый текст, сгенерированный ПОСЛЕ заливки источников, обычный
     редакт при выгрузке его не касается — обязателен отдельный проход здесь.
     Возвращает (markdown, secrets_found).
@@ -373,7 +355,7 @@ def _build_ask_markdown(nb_title: str, command_label: str, resp: dict,
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     answer_raw = (resp.get("answer") or "").strip()
     answer, n_secrets = security.redact_doc(answer_raw, source_label=f"ask:{nb_title}:answer")
-    refs = resp.get("references") or []
+    answer = _strip_citation_markers(answer)
     lines = [
         f"# {command_label}",
         "",
@@ -381,10 +363,6 @@ def _build_ask_markdown(nb_title: str, command_label: str, resp: dict,
         "",
         answer,
     ]
-    if refs:
-        ref_lines, n_cited_secrets = _refs_to_lines(refs, nb_title, "ask", source_titles)
-        n_secrets += n_cited_secrets
-        lines += ["", "## Источники", ""] + ref_lines
     return "\n".join(lines) + "\n", n_secrets
 
 
@@ -1666,15 +1644,11 @@ def main():
             # «за последний месяц», а это для модели значит «последний, что видно
             # в источниках» — на неполных данных период уплывёт.
             question = question.replace("{month}", month_str)
-            # {source_id: title} — чтобы в разделе «Источники» показать читаемое
-            # название источника (например «CRM — Сделки»), а не непрозрачный UUID.
-            src_list = load_notebooklm._list_sources(nb_id) or []
-            source_titles = {s.get("id"): s.get("title", s.get("id")) for s in src_list}
 
             print(f"  → [{nb_title}] запрашиваю дайджест...")
             try:
                 resp = load_notebooklm.ask_notebook(nb_id, question)
-                md, n_secrets = _build_digest_markdown(nb_title, period_ru, question, resp, source_titles)
+                md, n_secrets = _build_digest_markdown(nb_title, period_ru, question, resp)
                 digest_results.append({
                     "group_id": group_id, "notebook_name": nb_title,
                     "project_type": project_type, "period_ru": period_ru, "markdown": md,
@@ -1692,7 +1666,7 @@ def main():
             print(f"  → [{nb_title}] запрашиваю обзор...")
             try:
                 resp_ov = load_notebooklm.ask_notebook(nb_id, OVERVIEW_QUESTION)
-                md_ov, n_secrets_ov = _build_overview_markdown(nb_title, resp_ov, source_titles)
+                md_ov, n_secrets_ov = _build_overview_markdown(nb_title, resp_ov)
                 overview_results.append({
                     "group_id": group_id, "notebook_name": nb_title,
                     "project_type": project_type, "markdown": md_ov,
@@ -1753,11 +1727,8 @@ def main():
                 raise ValueError(f"у команды '{args.ask_command_id}' пустой question")
 
             print(f"  → [{nb_title}] запрашиваю «{cmd.get('label', args.ask_command_id)}»...")
-            src_list = load_notebooklm._list_sources(nb_id) or []
-            source_titles = {s.get("id"): s.get("title", s.get("id")) for s in src_list}
             resp = load_notebooklm.ask_notebook(nb_id, question)
-            md, n_secrets = _build_ask_markdown(nb_title, cmd.get("label", args.ask_command_id),
-                                                 resp, source_titles)
+            md, n_secrets = _build_ask_markdown(nb_title, cmd.get("label", args.ask_command_id), resp)
 
             payload.update({"status": "done", "markdown": md, "redacted": n_secrets})
             print(f"  ✅ [{nb_title}] ответ получен ({len(md)} символов, замаскировано ПДн: {n_secrets})")
