@@ -22,6 +22,7 @@ import re
 import sys
 import time
 import argparse
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -382,6 +383,9 @@ def _post_digest(url: str, token: str, payload: dict) -> None:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:300]
+        print(f"  ⚠️  Не удалось сохранить результат на хостинге ({url}): {e} — {detail}")
     except Exception as e:
         print(f"  ⚠️  Не удалось сохранить результат на хостинге ({url}): {e}")
 
@@ -1650,7 +1654,7 @@ def main():
                 resp = load_notebooklm.ask_notebook(nb_id, question)
                 md, n_secrets = _build_digest_markdown(nb_title, period_ru, question, resp)
                 digest_results.append({
-                    "group_id": group_id, "notebook_name": nb_title,
+                    "group_id": group_id, "notebook_name": nb_title, "month": month_str,
                     "project_type": project_type, "period_ru": period_ru, "markdown": md,
                 })
                 secrets_note = f", замаскировано ПДн: {n_secrets}" if n_secrets else ""
