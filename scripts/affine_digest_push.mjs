@@ -4,7 +4,7 @@
  * (connector/out/digest_payload.json, пишет connector.py --digest) в AFFiNE
  * как markdown-документы, разложенные по папкам сайдбара:
  *
- *   Дайджест проектов                (уже существует, создаётся ВРУЧНУЮ — если
+ *   Дайджест проектов [NotebookLM]    (уже существует, создаётся ВРУЧНУЮ — если
  *    ├── Клиентские проекты           нет, скрипт останавливается с ошибкой,
  *    │    └── <notebook_name>         а не создаёт корень сам и не льёт
  *    │         ├── Обзор              документы без структуры)
@@ -42,7 +42,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PAYLOAD_PATH = path.join(__dirname, "..", "out", "digest_payload.json");
 const PORT = 3917;
 const HTTP_TOKEN = crypto.randomBytes(24).toString("hex"); // только для этого процесса
-const ROOT_FOLDER_NAME = "Дайджест проектов";
+const ROOT_FOLDER_NAME = "Дайджест проектов [NotebookLM]";
 
 function requireEnv(name) {
   const v = process.env[name];
