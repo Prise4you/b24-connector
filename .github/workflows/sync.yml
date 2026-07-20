@@ -7,21 +7,29 @@ on:
   repository_dispatch:
     types: [sync_trigger, full_inventory_trigger, digest_trigger, ask_trigger]
 
-  # Резервное расписание: синк раз в 2 часа + ежемесячный дайджест проектов
-  # (1 число месяца, 06:00 UTC — job digest ниже матчит именно эту вторую
-  # строку по точному значению github.event.schedule, sync — первую).
-  # Интервал синка был часовым до 2026-07-19: реальный прогон занимает
-  # 80-98 мин (объём данных вырос), все прогоны сериализованы через
-  # job-level concurrency-группу nlm-session (см. комментарий ниже) —
-  # при часовом cron следующий триггер регулярно вставал в очередь поверх
-  # ещё не стартовавшего предыдущего, и GitHub Actions автоматически отменял
-  # более старый pending-прогон (штатное поведение concurrency-групп: новый
-  # pending вытесняет старый). Итог — ~35% часовых триггеров молча
-  # отменялись, ещё не успев запуститься (steps: [], без раннера), без
-  # какой-либо ошибки на стороне хостинга. Раз в 2 часа даёт запас над
-  # наблюдаемой длительностью прогона.
+  # Резервное расписание: общий синк раз в сутки (00:00 UTC = 03:00 МСК) +
+  # ежемесячный дайджест проектов (1 число месяца, 06:00 UTC — job digest
+  # ниже матчит именно вторую строку по точному значению
+  # github.event.schedule, sync — первую).
+  # Интервал синка был часовым до 2026-07-19, затем раз в 2 часа: реальный
+  # прогон занимает 80-98 мин (объём данных вырос), все прогоны
+  # сериализованы через job-level concurrency-группу nlm-session (см.
+  # комментарий ниже) — при часовом cron следующий триггер регулярно
+  # вставал в очередь поверх ещё не стартовавшего предыдущего, и GitHub
+  # Actions автоматически отменял более старый pending-прогон (штатное
+  # поведение concurrency-групп: новый pending вытесняет старый). Итог —
+  # ~35% часовых триггеров молча отменялись, ещё не успев запуститься
+  # (steps: [], без раннера), без какой-либо ошибки на стороне хостинга.
+  # 2026-07-20: перешли на раз в сутки — per-project поле sync_interval в
+  # панели оказалось декоративным (коннектор его никогда не читал, все
+  # проекты всегда синкались вместе по этому общему расписанию), поэтому
+  # убрали его из UI и сделали расписание по факту тем, чем оно уже было —
+  # общим для всех проектов раз в сутки. Актуальные события в Б24 всё
+  # равно доходят мгновенно через webhook (repository_dispatch,
+  # sync_trigger) — суточное расписание тут просто подстраховка на случай
+  # пропущенного вебхука.
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '0 0 * * *'
     - cron: '0 6 1 * *'
 
   # Ручной запуск через интерфейс GitHub (только job sync — см. его if:)
@@ -58,7 +66,7 @@ jobs:
   # ротированная сессия никогда не сохранится на хостинг).
   sync:
     if: >-
-      (github.event_name == 'schedule' && github.event.schedule == '0 */2 * * *') ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 0 * * *') ||
       (github.event_name == 'repository_dispatch' && github.event.action == 'sync_trigger') ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -203,13 +211,22 @@ jobs:
         env:
           NLM_BIN: notebooklm
           CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
+          # Точечный онбординг одного проекта (repository_dispatch digest_trigger
+          # с client_payload.group_id — например, автотриггер из config.php при
+          # включении digest.enabled) — пусто на плановом кроне и при ручном
+          # digest_trigger без group_id, тогда обрабатываются все проекты разом.
+          DIGEST_GROUP_ID: ${{ github.event.client_payload.group_id }}
         run: |
+          GROUP_ARG=()
+          if [ -n "$DIGEST_GROUP_ID" ]; then
+            GROUP_ARG=(--group "$DIGEST_GROUP_ID")
+          fi
           python connector.py \
             --config-url https://anitconf.ru/ntlm/api/config.php \
             --status-url https://anitconf.ru/ntlm/api/status.php \
             --nlm-session-url https://anitconf.ru/ntlm/api/nlm_session.php \
             --connector-token "$CONNECTOR_TOKEN" \
-            --digest
+            --digest "${GROUP_ARG[@]}"
 
       - name: Push digest(s) to AFFiNE
         env:
