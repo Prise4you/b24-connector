@@ -110,6 +110,79 @@ jobs:
             --nlm-session-url https://anitconf.ru/ntlm/api/nlm_session.php \
             --connector-token "$CONNECTOR_TOKEN"
 
+      # Подстраховка для автотриггера дайджеста (config.php при включении
+      # digest.enabled): мгновенный digest_trigger dispatch иногда молча
+      # отменяется concurrency-группой nlm-session, если прилетает второй
+      # диспатч раньше, чем первый успел стартовать (штатное поведение
+      # GitHub Actions — pending-прогон вытесняется, без ошибки где-либо;
+      # реальный инцидент 27.07.2026 — два дайджеста молча потерялись).
+      # config.php параллельно с мгновенным dispatch пишет group_id в
+      # digest_pending_queue в config.json. sync гоняется минимум раз в
+      # сутки (плюс на каждый sync_trigger от вебхука) и уже сидит в этой
+      # же concurrency-группе — дренаж очереди здесь физически не может
+      # столкнуться сам с собой. Повторный прогон для уже успешно
+      # запушенного проекта не вредит: affine_digest_push.mjs идемпотентен
+      # (Обзор создаётся один раз, Журнал/<Месяц> — create-or-replace).
+      - name: Check digest queue
+        id: check_queue
+        env:
+          CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
+        run: |
+          IDS=$(curl -s -H "X-Connector-Token: $CONNECTOR_TOKEN" \
+            "https://anitconf.ru/ntlm/api/config.php?raw=1" \
+            | jq -r '.digest_pending_queue // [] | map(tostring) | join(" ")')
+          echo "ids=$IDS" >> "$GITHUB_OUTPUT"
+          if [ -n "$IDS" ]; then
+            echo "has_queue=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_queue=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Node 20 (digest queue drain)
+        if: steps.check_queue.outputs.has_queue == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Версия зафиксирована сознательно — см. тот же шаг в джобе digest.
+      - name: Install affine-mcp-server (pinned)
+        if: steps.check_queue.outputs.has_queue == 'true'
+        run: npm install -g affine-mcp-server@2.5.0
+
+      - name: Install Node deps for push script
+        if: steps.check_queue.outputs.has_queue == 'true'
+        working-directory: scripts
+        run: npm install
+
+      - name: Drain digest queue
+        if: steps.check_queue.outputs.has_queue == 'true'
+        env:
+          NLM_BIN: notebooklm
+          CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
+          AFFINE_BASE_URL: https://know.anitconf.ru
+          AFFINE_WORKSPACE_ID: 87ff733f-41dd-4559-95ed-15989bcc772b
+          AFFINE_API_TOKEN: ${{ secrets.AFFINE_API_TOKEN }}
+          QUEUE_IDS: ${{ steps.check_queue.outputs.ids }}
+        run: |
+          for GID in $QUEUE_IDS; do
+            echo "→ дренаж дайджеста для group_id=$GID"
+            if python connector.py \
+                --config-url https://anitconf.ru/ntlm/api/config.php \
+                --status-url https://anitconf.ru/ntlm/api/status.php \
+                --nlm-session-url https://anitconf.ru/ntlm/api/nlm_session.php \
+                --connector-token "$CONNECTOR_TOKEN" \
+                --digest --group "$GID" \
+              && node scripts/affine_digest_push.mjs; then
+              echo "✅ group_id=$GID обработан, снимаю с очереди"
+              curl -s -o /dev/null -X POST \
+                -H "X-Connector-Token: $CONNECTOR_TOKEN" -H "Content-Type: application/json" \
+                --data "{\"patch\":{\"kind\":\"digest_queue_ack\",\"group_id\":$GID}}" \
+                https://anitconf.ru/ntlm/api/config.php
+            else
+              echo "⚠️ group_id=$GID не удалось — остаётся в очереди до следующего прогона"
+            fi
+          done
+
   # Полная инвентаризация NotebookLM-аккаунта — ТОЛЬКО по ручному запросу
   # из админки (кнопка «Сканировать аккаунт»), не участвует в плановом/webhook
   # синке. Та же concurrency-группа (job-level, см. sync выше) гарантирует,

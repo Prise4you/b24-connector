@@ -1,6 +1,8 @@
 {
   "webhook_url": "https://ВАШ-ПОРТАЛ.bitrix24.ru/rest/1/ТОКЕН_ВЕБХУКА/",
 
+  "digest_pending_queue": [],
+
   "projects": [
     {
       "group_id": 506,
