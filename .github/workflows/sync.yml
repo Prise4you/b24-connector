@@ -239,7 +239,16 @@ jobs:
       (github.event_name == 'schedule' && github.event.schedule == '0 6 1 * *') ||
       (github.event_name == 'repository_dispatch' && github.event.action == 'digest_trigger')
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # Таймаут поднят 40→90 (2026-09-09): ежемесячный дайджест без --group
+    # проходит ВСЕ digest.enabled=true проекты последовательно (2 запроса к
+    # NotebookLM на проект — дайджест + обзор). На 01.09.2026 их было 28,
+    # шаг «Run digest» упёрся в 40 мин и был убит GitHub'ом по таймауту
+    # (conclusion=cancelled, не failure — легко не заметить). connector.py
+    # копит результаты в памяти и пишет digest_payload.json только ПОСЛЕ
+    # цикла по всем проектам — при убийстве по таймауту весь прогон
+    # пропадает без следа, не только «хвост» необработанных. Взят запас x2
+    # над наблюдаемым временем (26-40 мин), тот же принцип, что у джобы sync.
+    timeout-minutes: 90
     concurrency:
       group: nlm-session
       cancel-in-progress: false
