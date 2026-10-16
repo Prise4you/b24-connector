@@ -319,6 +319,7 @@ jobs:
             --digest "${GROUP_ARG[@]}"
 
       - name: Push digest(s) to AFFiNE
+        if: ${{ success() || failure() }}
         env:
           AFFINE_BASE_URL: https://know.anitconf.ru
           AFFINE_WORKSPACE_ID: 87ff733f-41dd-4559-95ed-15989bcc772b

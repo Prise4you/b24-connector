@@ -220,10 +220,8 @@ OVERVIEW_PROMPT_VERSION = "обзор v1"
 # от digest.question (который параметризуется в config.json на проект и
 # ограничен месяцем {month}), этот вопрос один и тот же для всех проектов и не
 # привязан к периоду: цель — глубокая сводка по ВСЕЙ истории проекта, а не за
-# конкретный месяц. Спрашивается на каждом прогоне --digest (Python не знает,
-# создан ли уже документ «Обзор» в AFFiNE — это решает affine_digest_push.mjs,
-# создавая его только один раз); лишний ask() в последующие месяцы — принятый
-# компромисс ради простоты (см. connector/scripts/affine_digest_push.mjs).
+# конкретный месяц. Спрашивается при точечном --digest --group (онбординг),
+# но не в общем месячном прогоне: документ «Обзор» создаётся только раз.
 OVERVIEW_QUESTION = (
     "Составь максимально подробную сводную информацию о проекте целиком, "
     "на основе ВСЕХ предоставленных источников за всё время.\n\n"
@@ -1643,6 +1641,7 @@ def main():
             question = (digest_cfg.get("question") or "").strip()
             if not nb_id or not question:
                 print(f"  ⚠️  [{nb_title}] digest.enabled=true, но нет notebook_id/question — пропуск")
+                digest_errors.append({"group_id": group_id, "name": nb_title, "error": "нет notebook_id/question"})
                 continue
             # {month} в шаблоне → конкретный месяц. Без подстановки пришлось бы писать
             # «за последний месяц», а это для модели значит «последний, что видно
@@ -1651,7 +1650,7 @@ def main():
 
             print(f"  → [{nb_title}] запрашиваю дайджест...")
             try:
-                resp = load_notebooklm.ask_notebook(nb_id, question)
+                resp = load_notebooklm.ask_notebook(nb_id, question, timeout=360)
                 md, n_secrets = _build_digest_markdown(nb_title, period_ru, question, resp)
                 digest_results.append({
                     "group_id": group_id, "notebook_name": nb_title, "month": month_str,
@@ -1664,12 +1663,13 @@ def main():
                 digest_errors.append({"group_id": group_id, "name": nb_title, "error": str(e)})
                 continue
 
-            # Обзор — разовая сводка на весь проект (см. OVERVIEW_QUESTION). Спрашивается
-            # каждый прогон: Python не знает, есть ли уже документ «Обзор» в AFFiNE —
-            # это решает affine_digest_push.mjs (создаёт один раз, дальше пропускает).
+            # Обзор нужен при точечном онбординге; общий месячный прогон не
+            # повторяет 30 лишних вопросов и не упирается в лимит чата NotebookLM.
+            if not args.group:
+                continue
             print(f"  → [{nb_title}] запрашиваю обзор...")
             try:
-                resp_ov = load_notebooklm.ask_notebook(nb_id, OVERVIEW_QUESTION)
+                resp_ov = load_notebooklm.ask_notebook(nb_id, OVERVIEW_QUESTION, timeout=360)
                 md_ov, n_secrets_ov = _build_overview_markdown(nb_title, resp_ov)
                 overview_results.append({
                     "group_id": group_id, "notebook_name": nb_title,
@@ -1679,6 +1679,7 @@ def main():
                 print(f"  ✅ [{nb_title}] обзор получен ({len(md_ov)} символов{secrets_note})")
             except Exception as e:
                 print(f"  ❌ [{nb_title}] обзор: {e}")
+                digest_errors.append({"group_id": group_id, "name": nb_title, "error": f"обзор: {e}"})
 
         # Аудит на хостинге — отдельно и НЕ критично для успеха AFFiNE-шага.
         if args.status_url and connector_token and digest_results:
@@ -1701,6 +1702,9 @@ def main():
                     persist_nlm_session(nlm_session_url, connector_token)
             except Exception as e:
                 print(f"  ⚠️  Проверка сессии перед сохранением не удалась ({e})")
+        if digest_errors:
+            raise RuntimeError("Дайджест не завершён для group_id: " +
+                               ", ".join(str(e["group_id"]) for e in digest_errors))
         return
 
     # ── Интерактивный ask-запрос: ОДИН конкретный клик из вкладки проекта в Б24 ──
