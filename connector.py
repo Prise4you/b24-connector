@@ -149,8 +149,8 @@ def push_remote_nlm_session(url: str, token: str, state_b64: str) -> None:
 
 def restore_nlm_session(url: str, token: str) -> bool:
     """
-    В начале прогона: если на хостинге есть живая копия сессии — записать её в
-    DEFAULT_STORAGE поверх seed'а из секрета. Возвращает True, если восстановил.
+    В начале прогона: использовать серверную копию, только если она жива;
+    иначе вернуть seed из секрета. Возвращает True при живой серверной копии.
     """
     import base64, load_notebooklm
     try:
@@ -161,17 +161,23 @@ def restore_nlm_session(url: str, token: str) -> bool:
     if not b64:
         print("  ℹ️  На хостинге ещё нет живой сессии NotebookLM — использую seed из секрета (холодный старт)")
         return False
+    dst = Path(load_notebooklm.DEFAULT_STORAGE)
+    seed = dst.read_bytes() if dst.exists() else None
     try:
         raw = base64.b64decode(b64)
-        dst = Path(load_notebooklm.DEFAULT_STORAGE)
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(raw)
         os.chmod(dst, 0o600)
-        print("  ✅ Живая сессия NotebookLM восстановлена с хостинга")
-        return True
+        if load_notebooklm.session_status().get("ok"):
+            print("  ✅ Живая сессия NotebookLM восстановлена с хостинга")
+            return True
     except Exception as e:
-        print(f"  ⚠️  Не удалось записать живую сессию NotebookLM ({e}), использую seed из секрета")
-        return False
+        print(f"  ⚠️  Не удалось проверить серверную сессию NotebookLM ({e}), использую seed из секрета")
+    if seed is not None:
+        dst.write_bytes(seed)
+        os.chmod(dst, 0o600)
+    print("  ⚠️  Серверная сессия NotebookLM истекла — использую seed из секрета")
+    return False
 
 
 def persist_nlm_session(url: str, token: str) -> None:
