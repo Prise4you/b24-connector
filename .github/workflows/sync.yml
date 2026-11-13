@@ -34,6 +34,12 @@ on:
 
   # Ручной запуск через интерфейс GitHub (только job sync — см. его if:)
   workflow_dispatch:
+    inputs:
+      group:
+        description: 'Диагностика: синхронизировать один group_id (0 = все)'
+        type: number
+        required: false
+        default: 0
 
 # КРИТИЧНО: сессию NotebookLM (NLM_STORAGE_STATE) может использовать только
 # ОДИН процесс одновременно — Google инвалидирует её при параллельном
@@ -111,12 +117,15 @@ jobs:
         env:
           NLM_BIN: notebooklm
           CONNECTOR_TOKEN: ${{ secrets.CONNECTOR_TOKEN }}
+          GROUP_ID: ${{ inputs.group || 0 }}
         run: |
+          args=()
+          if [ "$GROUP_ID" -gt 0 ]; then args=(--group "$GROUP_ID"); fi
           python connector.py \
             --config-url https://anitconf.ru/ntlm/api/config.php \
             --status-url https://anitconf.ru/ntlm/api/status.php \
             --nlm-session-url https://anitconf.ru/ntlm/api/nlm_session.php \
-            --connector-token "$CONNECTOR_TOKEN"
+            --connector-token "$CONNECTOR_TOKEN" "${args[@]}"
 
       # Подстраховка для автотриггера дайджеста (config.php при включении
       # digest.enabled): мгновенный digest_trigger dispatch иногда молча
