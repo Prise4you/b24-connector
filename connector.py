@@ -58,7 +58,7 @@ def fetch_remote_config(url: str, token: str) -> dict:
     return data
 
 
-def post_run_status(url: str, token: str, payload: dict) -> None:
+def post_run_status(url: str, token: str, payload: dict) -> bool:
     """Отправить результат прогона на хостинг (POST, X-Connector-Token)."""
     body = json.dumps(payload, ensure_ascii=False).encode()
     req = urllib.request.Request(
@@ -69,9 +69,14 @@ def post_run_status(url: str, token: str, payload: dict) -> None:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
+            result = json.loads(resp.read().decode("utf-8"))
+        if result.get("ok") is True:
+            return True
     except Exception as e:
         print(f"  ⚠️  Не удалось отправить статус на хостинг: {e}")
+        return False
+    print("  ⚠️  Хостинг не подтвердил запись статуса")
+    return False
 
 
 def push_remote_config(url: str, token: str, cfg: dict) -> None:
@@ -1987,6 +1992,8 @@ def main():
                                 print("  Конфиг обновлён на хостинге")
                             except Exception as e:
                                 print(f"  ⚠️  Не удалось сохранить конфиг на хостинге ({e})")
+                                nlm_errors.append({"group_id": group_id, "name": nb_title,
+                                                   "error": "не удалось сохранить notebook_id"})
                         else:
                             save_config(cfg, args, connector_token)
                     print(f"✅ NotebookLM: https://notebooklm.google.com/notebook/{new_id}")
@@ -2112,11 +2119,15 @@ def main():
                                 print("  Конфиг обновлён на хостинге")
                             except Exception as e:
                                 print(f"  ⚠️  Не удалось сохранить конфиг на хостинге ({e})")
+                                nlm_errors.append({"group_id": 0, "name": "CRM АНИТ",
+                                                   "error": "не удалось сохранить notebook_id"})
                         else:
                             save_config(cfg, args, connector_token)
                     print(f"✅ NotebookLM CRM: https://notebooklm.google.com/notebook/{new_id}")
                 except Exception as e:
                     print(f"❌ NotebookLM CRM: {e}")
+                    nlm_errors.append({"group_id": 0, "name": "CRM АНИТ",
+                                       "error": str(e)})
 
     # ── Сохраняем last_run ────────────────────────────────────────────────────
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -2127,6 +2138,7 @@ def main():
     elapsed = round(time.time() - _run_start, 1)
 
     # ── POST статуса на хостинг ───────────────────────────────────────────────
+    status_post_ok = True
     if args.status_url and connector_token:
         # Статус прогона учитывает и падения проектов (project_errors), и сбои
         # загрузки в NotebookLM (nlm_errors). Истёкшая сессия NotebookLM —
@@ -2195,7 +2207,7 @@ def main():
             except Exception as e:
                 print(f"  ⚠️  Снимок NotebookLM не собран: {e}")
         print(f"\n→ Отправляю статус на {args.status_url} ...")
-        post_run_status(args.status_url, connector_token, payload)
+        status_post_ok = post_run_status(args.status_url, connector_token, payload)
 
     # ── Сохранить ротированную сессию NotebookLM обратно на хостинг ───────────
     # Только на реальном (не dry-run) прогоне и только если сессия жива — иначе
@@ -2220,7 +2232,7 @@ def main():
         print(f"\n[dry-run] Готово. Секретов замаскировано: {secrets_grand_total}. Время: {elapsed}s")
         return
 
-    if nlm_session_dead or project_errors or nlm_errors:
+    if nlm_session_dead or project_errors or nlm_errors or not status_post_ok:
         sys.exit(1)
 
     print(f"\n{'═'*50}")

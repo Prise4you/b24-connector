@@ -1,0 +1,70 @@
+name: B24 → NotebookLM Failure Alert
+
+on:
+  workflow_run:
+    workflows: ["B24 → NotebookLM Sync"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  notify:
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.repository == 'Prise4you/b24-connector' &&
+       github.event.workflow_run.repository.full_name == 'Prise4you/b24-connector' &&
+       github.event.workflow_run.head_repository.full_name == 'Prise4you/b24-connector' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.name == 'B24 → NotebookLM Sync' &&
+       github.event.workflow_run.path == '.github/workflows/sync.yml' &&
+       github.event.workflow_run.conclusion != 'success') ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.repository == 'Prise4you/b24-connector' &&
+       github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    environment: b24-nlm-alert
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Classify sync attempt
+        id: classify
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ALERT_EVENT: ${{ github.event_name }}
+          ALERT_RUN_ID: ${{ github.event.workflow_run.id || github.run_id }}
+          ALERT_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || github.run_attempt }}
+          ALERT_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          ALERT_SOURCE_REPO: ${{ github.event.workflow_run.repository.full_name }}
+          ALERT_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          ALERT_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          ALERT_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          ALERT_WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
+        run: python scripts/notify_sync_failure.py classify
+
+      - name: Send Bitrix24 chat alert
+        if: steps.classify.outputs.send == 'true'
+        env:
+          B24_NLM_ALERT_WEBHOOK: ${{ secrets.B24_NLM_ALERT_WEBHOOK }}
+          ALERT_PHASE: ${{ steps.classify.outputs.phase }}
+          ALERT_EVENT: ${{ github.event_name }}
+          ALERT_RUN_ID: ${{ github.event.workflow_run.id || github.run_id }}
+          ALERT_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || github.run_attempt }}
+          ALERT_SOURCE_REPO: ${{ github.event.workflow_run.repository.full_name }}
+          ALERT_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          ALERT_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          ALERT_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          ALERT_WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
+        run: python scripts/notify_sync_failure.py send
