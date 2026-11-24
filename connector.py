@@ -2220,6 +2220,9 @@ def main():
         print(f"\n[dry-run] Готово. Секретов замаскировано: {secrets_grand_total}. Время: {elapsed}s")
         return
 
+    if nlm_session_dead or project_errors or nlm_errors:
+        sys.exit(1)
+
     print(f"\n{'═'*50}")
     print(f"✅ Всё готово. Секретов замаскировано: {secrets_grand_total}. Время: {elapsed}s")
 
